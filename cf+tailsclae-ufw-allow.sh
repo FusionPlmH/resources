@@ -1,7 +1,7 @@
 #!/bin/bash
 echo ""
 echo ""
-echo "Proxmox VE Access only for Cloudflared and Tailscale"
+echo "Proxmox VE Access only for Cloudflared Tunnel and Tailscale"
 echo ""
 echo ""
 echo ""
