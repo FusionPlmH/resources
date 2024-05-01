@@ -38,5 +38,4 @@ done
 
 ufw allow in on tailscale0
 ufw allow out on tailscale0
-y
 ufw enable
