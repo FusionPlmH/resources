@@ -14,8 +14,7 @@ if ! command -v ufw >/dev/null 2>&1; then
     fi
 fi
 
-for line in $(curl -s https://www.cloudflare.com/ips-v4)$(curl -s https://www.cloudflare.com/ips-v6)
-do
+for line in $(curl -s https://www.cloudflare.com/ips-v4)$(curl -s https://www.cloudflare.com/ips-v6) ;do
     ufw allow from $line to any port 443
 done
 
