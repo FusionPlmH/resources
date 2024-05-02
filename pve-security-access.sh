@@ -12,7 +12,6 @@ echo "    Powered by FsuionPlmH"
 
 if ! command -v ufw >/dev/null 2>&1; then
     if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
-        release=$(grep -Eo "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release* | head -1)
         apt update && apt install -y ufw
     else
         echo "==============="
