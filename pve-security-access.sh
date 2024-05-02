@@ -18,5 +18,11 @@ for line in $(curl -s https://www.cloudflare.com/ips-v4)$(curl -s https://www.cl
     ufw allow from $line to any port 443
 done
 
+prefix=$(ip -o -f inet addr show dev vmbr0 | awk '{print $4}' | cut -d '/' -f 2)
+ip_range=$(ip -o -f inet addr show dev vmbr0 | awk '{print $4}' | cut -d '/' -f 1 | awk -F. '{OFS="."; $4=0; print}')
+cidr="$ip_range/$prefix"
+ufw allow from $cidr to any port 8006
+
+
 ufw allow in out on tailscale0
 ufw enable
