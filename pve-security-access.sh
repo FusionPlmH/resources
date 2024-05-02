@@ -22,12 +22,10 @@ if ! command -v ufw >/dev/null 2>&1; then
 fi
 
 for line in $(curl -s https://www.cloudflare.com/ips-v4); do
-    echo "Reading $line from CloudFlare's official IP list."
     ufw allow from $line to any port 443
 done
 
 for line in $(curl -s https://www.cloudflare.com/ips-v6); do
-    echo "Reading $line from CloudFlare's official IP list."
     ufw allow from $line to any port 443
 done
 
