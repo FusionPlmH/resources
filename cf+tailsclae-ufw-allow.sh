@@ -24,16 +24,12 @@ fi
 
 for line in $(curl -s https://www.cloudflare.com/ips-v4); do
     echo "Reading $line from CloudFlare's official IP list."
-    ufw allow from $line to any port 80
     ufw allow from $line to any port 443
-    ufw allow from $line to any port 8006
 done
 
 for line in $(curl -s https://www.cloudflare.com/ips-v6); do
     echo "Reading $line from CloudFlare's official IP list."
-    ufw allow from $line to any port 80
     ufw allow from $line to any port 443
-    ufw allow from $line to any port 8006
 done
 
 ufw allow in on tailscale0
