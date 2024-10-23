@@ -72,7 +72,6 @@ fi
 
 
 echo "Setting Up Fail2ban......"
-cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
 echo "[ufw]" >> /etc/fail2ban/jail.local
 echo "enabled=true" >> /etc/fail2ban/jail.local
 echo "filter=ufw.aggressive" >> /etc/fail2ban/jail.local
