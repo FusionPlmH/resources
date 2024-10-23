@@ -71,6 +71,8 @@ fi
 
 
 
+echo "Setting Up Fail2ban......"
+cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
 echo "[ufw]" >> /etc/fail2ban/jail.local
 echo "enabled=true" >> /etc/fail2ban/jail.local
 echo "filter=ufw.aggressive" >> /etc/fail2ban/jail.local
@@ -78,6 +80,14 @@ echo "action=iptables-allports" >> /etc/fail2ban/jail.local
 echo "logpath=/var/log/ufw.log" >> /etc/fail2ban/jail.local
 echo "maxretry=5" >> /etc/fail2ban/jail.local
 echo "bantime=7d" >> /etc/fail2ban/jail.local
+
+
+touch /etc/fail2ban/filter.d/ufw.aggressive.conf
+echo "[Definition]" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
+echo "failregex = [UFW BLOCK].+SRC=<HOST> DST" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
+echo "ignoreregex =" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
+
+
 
 
 touch /etc/fail2ban/filter.d/ufw.aggressive.conf
