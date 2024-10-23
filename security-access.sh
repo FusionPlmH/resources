@@ -11,7 +11,7 @@ echo "         Powered by FsuionPlmH"
 
 check_and_install() {
     package=$1
-    if ! dpkg -l | grep -q $package; then
+    if !  dpkg-query -W -f='${Status}' $package 2>/dev/null | grep -q "install ok installed"; then
         if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
             echo "Your system is supported. Now installing $package..."
             sudo apt update && sudo apt install -y $package
