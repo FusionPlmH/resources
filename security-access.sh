@@ -7,15 +7,25 @@ echo "         Powered by FsuionPlmH"
 
 
 ## Check support and install package
-if ! command -v ufw >/dev/null 2>&1; then
-    if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
-		echo "Your system is supported now install the tools"
-        apt update && apt install -y ufw fail2ban
+#!/bin/bash
+
+check_and_install() {
+    package=$1
+    if ! command -v $package >/dev/null 2>&1; then
+        if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
+            echo "Your system is supported. Now installing $package..."
+            sudo apt update && sudo apt install -y $package
+        else
+            echo "$package not supported on this system."
+            exit 1
+        fi
     else
-        echo "Not supported"
-        exit 1
+        echo "$package is already installed."
     fi
-fi
+}
+
+check_and_install ufw
+check_and_install fail2ban
 
 
 ## Check Cloudflared
