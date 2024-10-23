@@ -71,13 +71,13 @@ fi
 
 
 
-echo "[ufw]" >> /etc/fail2ban/jail.conf
-echo "enabled=true" >> /etc/fail2ban/jail.conf
-echo "filter=ufw.aggressive" >> /etc/fail2ban/jail.conf
-echo "action=iptables-allports" >> /etc/fail2ban/jail.conf
-echo "logpath=/var/log/ufw.log" >> /etc/fail2ban/jail.conf
-echo "maxretry=5" >> /etc/fail2ban/jail.conf
-echo "bantime=7d" >> /etc/fail2ban/jail.conf
+echo "[ufw]" >> /etc/fail2ban/jail.local
+echo "enabled=true" >> /etc/fail2ban/jail.local
+echo "filter=ufw.aggressive" >> /etc/fail2ban/jail.local
+echo "action=iptables-allports" >> /etc/fail2ban/jail.local
+echo "logpath=/var/log/ufw.log" >> /etc/fail2ban/jail.local
+echo "maxretry=5" >> /etc/fail2ban/jail.local
+echo "bantime=7d" >> /etc/fail2ban/jail.local
 
 
 touch /etc/fail2ban/filter.d/ufw.aggressive.conf
