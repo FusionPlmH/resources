@@ -7,8 +7,6 @@ echo "         Powered by FsuionPlmH"
 
 
 ## Check support and install package
-#!/bin/bash
-
 check_and_install() {
     package=$1
     if !  dpkg-query -W -f='${Status}' $package 2>/dev/null | grep -q "install ok installed"; then
