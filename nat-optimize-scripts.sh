@@ -1,7 +1,15 @@
 #!/bin/bash
 
+# Title Section
+echo ""
+echo "   Security access and Nat optimize for" 
+echo "     Debian Router / Debian Forwarder"
+echo "        Welcome to use This Tool "
+echo "         Powered by FsuionPlmH"
+echo ""
+
 # Define constants
-PAM_LIMITS="/etc/p.d/common-session"
+PAM_LIMITS="/etc/pam.d/common-session"
 LIMITS_CONF="/etc/security/limits.conf"
 SYSCTL_CONF="/etc/sysctl.conf"
 INTERFACE="ens19"
@@ -22,7 +30,7 @@ check_and_install() {
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
         if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
             echo "Installing $package..."
-            if ! apt update -qq && apt install -yqq "$package"; then
+            if ! apt update && apt install -y "$package"; then
                 echo "Error: Failed to install $package"
                 exit 1
             fi
@@ -35,10 +43,10 @@ check_and_install() {
     fi
 }
 
-# Function to run commands silently
+# Function to run commands and display output
 run_command() {
   echo "Running: $*" # Show the command being run
-  if ! "$@" > /dev/null 2>&1; then
+  if ! "$@"; then
       echo "Error: Command '$*' failed"
       exit 1
   fi
@@ -185,8 +193,8 @@ reload_sysctl() {
 install_xanmod_kernel() {
   run_command wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
   echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-  run_command apt update -qq
-  run_command apt install -yqq linux-xanmod-rt-x64v3
+  run_command apt update
+  run_command apt install -y linux-xanmod-rt-x64v3
 }
 
 # Function to configure GRUB
@@ -230,8 +238,8 @@ configure_network() {
 # Function to install and configure UFW
 configure_firewall() {
   echo "Installing and configuring UFW..."
-  run_command apt update -qq
-  run_command apt install -yqq ufw
+  run_command apt update
+  run_command apt install -y ufw
 
   # Allow SSH
   run_command ufw allow ssh
