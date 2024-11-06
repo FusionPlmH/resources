@@ -24,16 +24,13 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Function to check and install a package
+# Check and install a package
 check_and_install() {
     package=$1
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
         if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
             echo "Installing $package..."
-            if ! apt update && apt install -y "$package"; then
-                echo "Error: Failed to install $package"
-                exit 1
-            fi
+            apt-get update -qq > /dev/null && apt-get install -y "$package" -qq > /dev/null
         else
             echo "$package not supported on this system."
             exit 1
@@ -43,17 +40,9 @@ check_and_install() {
     fi
 }
 
-# Function to run commands and display output
-run_command() {
-  echo "Running: $*" # Show the command being run
-  if ! "$@"; then
-      echo "Error: Command '$*' failed"
-      exit 1
-  fi
-}
-
-# Function to check and install required packages
+# Check and install required packages
 check_required_packages() {
+    echo "Checking required packages..."
     local packages=("wget" "gpg" "ufw" "sed" "iproute2" "iptables")
 
     for package in "${packages[@]}"; do
@@ -61,13 +50,14 @@ check_required_packages() {
     done
 }
 
-# Function to check and create sysctl.conf if not exists
+# Check and create sysctl.conf if not exists
 check_sysctl() {
   [ ! -f "$SYSCTL_CONF" ] && touch "$SYSCTL_CONF"
 }
 
-# Function to remove existing entries from sysctl.conf
+# Remove existing entries from sysctl.conf
 remove_existing_entries() {
+  echo "Removing existing sysctl entries..."
   local keys=(
     "net.core.default_qdisc"
     "net.ipv4.tcp_congestion_control"
@@ -110,14 +100,13 @@ remove_existing_entries() {
   done
 }
 
-# Function to apply ulimit and other configurations
+# Apply ulimit and other configurations
 ulimited_tuning() {
+  echo "Applying ulimit settings..."
   check_sysctl
 
-  # Enable 'session required pam_limits.so'
   grep -q 'pam_limits.so' "$PAM_LIMITS" || echo 'session required pam_limits.so' >> "$PAM_LIMITS"
 
-  # Update limits.conf
   {
     echo '* soft nofile 65535'
     echo '* hard nofile 65535'
@@ -127,19 +116,17 @@ ulimited_tuning() {
     echo '* hard memlock unlimited'
   } > "$LIMITS_CONF"
 
-  # Set ulimit in profile if not set
   grep -q "ulimit" /etc/profile || echo "ulimit -SHn 65535" >> /etc/profile
 
-  # Apply ulimit settings
   ulimit -SHn 65535 && ulimit -c unlimited
 }
 
-# Function to apply TCP/UDP tuning
+# Apply TCP/UDP tuning
 tcp_udp_tuning() {
+  echo "Applying TCP/UDP tuning..."
   check_sysctl
   remove_existing_entries
 
-  # Add TCP and network settings
   cat << EOF >> "$SYSCTL_CONF"
 # General network settings
 net.core.default_qdisc=fq
@@ -183,41 +170,42 @@ net.ipv4.udp_wmem_min=8192
 EOF
 }
 
-# Function to reload sysctl settings
+# Reload sysctl settings
 reload_sysctl() {
-  run_command sysctl -p
-  run_command sysctl --system
+  echo "Reloading sysctl settings..."
+  sysctl -p > /dev/null
+  sysctl --system > /dev/null
 }
 
-# Function to install Xanmod kernel
+# Install Xanmod kernel
 install_xanmod_kernel() {
-  run_command wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
+  echo "Installing Xanmod kernel..."
+  wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
   echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-  run_command apt update
-  run_command apt install -y linux-xanmod-rt-x64v3
+  apt-get update -qq > /dev/null
+  apt-get install -y linux-xanmod-rt-x64v3 -qq > /dev/null
 }
 
-# Function to configure GRUB
+# Configure GRUB
 configure_grub() {
-  run_command sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub
-  run_command update-grub
+  echo "Configuring GRUB..."
+  sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub
+  update-grub > /dev/null 2>&1
 }
 
-# Function to configure network interface
+# Configure network interface
 configure_network() {
+  echo "Configuring network interface..."
   local config_file="/etc/network/interfaces"
   
   if ip link show | grep -q "$INTERFACE"; then
     echo "Configuring $INTERFACE..."
 
-    # Backup current configuration
     cp "$config_file" "${config_file}.bak"
 
-    # Edit interface configuration
     sed -i "/iface $INTERFACE inet/d" "$config_file"
     sed -i "/auto $INTERFACE/d" "$config_file"
 
-    # Add new configuration
     {
       echo "auto $INTERFACE"
       echo "iface $INTERFACE inet static"
@@ -228,32 +216,27 @@ configure_network() {
       echo "    post-down iptables -t nat -D POSTROUTING -s '10.10.10.0/24' -j MASQUERADE"
     } >> "$config_file"
 
-    # Restart networking
-    run_command systemctl restart networking
+    systemctl restart networking > /dev/null
   else
     echo "Interface $INTERFACE not found."
   fi
 }
 
-# Function to install and configure UFW
+# Install and configure UFW
 configure_firewall() {
   echo "Installing and configuring UFW..."
-  run_command apt update
-  run_command apt install -y ufw
+  apt-get update -qq > /dev/null
+  apt-get install -y ufw -qq > /dev/null
 
-  # Allow SSH
-  run_command ufw allow ssh
-
-  # Deny ping
+  ufw allow ssh
   echo "Blocking ICMP (ping)..."
   echo "net.ipv4.icmp_echo_ignore_all=1" >> "$SYSCTL_CONF"
-  run_command sysctl -p
+  sysctl -p > /dev/null
 
-  # Enable UFW
-  run_command ufw enable
+  ufw enable
 }
 
-# Main function to execute all scripts
+# Main function to execute all steps
 main() {
   check_required_packages
   configure_network
