@@ -1,15 +1,14 @@
 #!/bin/bash
 
 # Define constants
-PAM_LIMITS="/etc/pam.d/common-session"
+PAM_LIMITS="/etc/p.d/common-session"
 LIMITS_CONF="/etc/security/limits.conf"
 SYSCTL_CONF="/etc/sysctl.conf"
 INTERFACE="ens19"
 LOG_FILE="/var/log/system_tuning.log"
 
 # Set up logging
-exec > >(tee -i "$LOG_FILE")
-exec 2>&1
+exec > >(tee -i "$LOG_FILE") 2>&1
 
 # Check for root privileges
 if [ "$EUID" -ne 0 ]; then
@@ -17,9 +16,41 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Function to run commands safely
+# Function to check and install a package
+check_and_install() {
+    package=$1
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
+        if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
+            echo "Installing $package..."
+            if ! apt update -qq && apt install -yqq "$package"; then
+                echo "Error: Failed to install $package"
+                exit 1
+            fi
+        else
+            echo "$package not supported on this system."
+            exit 1
+        fi
+    else
+        echo "$package is already installed."
+    fi
+}
+
+# Function to run commands silently
 run_command() {
-  "$@" || { echo "Error: $*" >&2; exit 1; }
+  echo "Running: $*" # Show the command being run
+  if ! "$@" > /dev/null 2>&1; then
+      echo "Error: Command '$*' failed"
+      exit 1
+  fi
+}
+
+# Function to check and install required packages
+check_required_packages() {
+    local packages=("wget" "gpg" "ufw" "sed" "iproute2" "iptables")
+
+    for package in "${packages[@]}"; do
+        check_and_install "$package"
+    done
 }
 
 # Function to check and create sysctl.conf if not exists
@@ -154,13 +185,13 @@ reload_sysctl() {
 install_xanmod_kernel() {
   run_command wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
   echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-  run_command apt update
-  run_command apt install -y linux-xanmod-rt-x64v3
+  run_command apt update -qq
+  run_command apt install -yqq linux-xanmod-rt-x64v3
 }
 
 # Function to configure GRUB
 configure_grub() {
-  sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub
+  run_command sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub
   run_command update-grub
 }
 
@@ -199,8 +230,8 @@ configure_network() {
 # Function to install and configure UFW
 configure_firewall() {
   echo "Installing and configuring UFW..."
-  run_command apt update
-  run_command apt install -y ufw
+  run_command apt update -qq
+  run_command apt install -yqq ufw
 
   # Allow SSH
   run_command ufw allow ssh
@@ -216,6 +247,7 @@ configure_firewall() {
 
 # Main function to execute all scripts
 main() {
+  check_required_packages
   configure_network
   configure_firewall
   ulimited_tuning
