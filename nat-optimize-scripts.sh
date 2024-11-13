@@ -2,7 +2,7 @@
 
 # Title Section
 echo ""
-echo "   Security access and Nat optimize for" 
+echo "        OS/Network optimize for" 
 echo "     Debian Router / Debian Forwarder"
 echo "        Welcome to use This Tool "
 echo "         Powered by FsuionPlmH"
