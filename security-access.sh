@@ -69,31 +69,31 @@ fi
 
 
 
-echo "Setting Up Fail2ban......"
+echo "Setting Up Fail2ban..."
+
+# Add UFW settings to Fail2ban configuration
 echo "[ufw]" >> /etc/fail2ban/jail.local
-echo "enabled=true" >> /etc/fail2ban/jail.local
-echo "filter=ufw.aggressive" >> /etc/fail2ban/jail.local
-echo "action=iptables-allports" >> /etc/fail2ban/jail.local
-echo "logpath=/var/log/ufw.log" >> /etc/fail2ban/jail.local
-echo "maxretry=5" >> /etc/fail2ban/jail.local
-echo "bantime=7d" >> /etc/fail2ban/jail.local
+echo "enabled = true" >> /etc/fail2ban/jail.local
+echo "filter = ufw-aggressive" >> /etc/fail2ban/jail.local
+echo "action = iptables-allports" >> /etc/fail2ban/jail.local
+echo "logpath = /var/log/ufw.log" >> /etc/fail2ban/jail.local
+echo "maxretry = 5" >> /etc/fail2ban/jail.local
+echo "bantime = 7d" >> /etc/fail2ban/jail.local
 
+# Create the filter definition for UFW
+touch /etc/fail2ban/filter.d/ufw-aggressive.conf
+echo "[Definition]" >> /etc/fail2ban/filter.d/ufw-aggressive.conf
+echo "failregex = 
 
-touch /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "[Definition]" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "failregex = [UFW BLOCK].+SRC=<HOST> DST" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "ignoreregex =" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
+\[UFW BLOCK\]
 
+.*SRC=<HOST> DST" >> /etc/fail2ban/filter.d/ufw-aggressive.conf
+echo "ignoreregex =" >> /etc/fail2ban/filter.d/ufw-aggressive.conf
 
-
-
-touch /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "[Definition]" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "failregex = [UFW BLOCK].+SRC=<HOST> DST" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
-echo "ignoreregex =" >> /etc/fail2ban/filter.d/ufw.aggressive.conf
-
-
+# Enable UFW
 ufw enable
+
+# Enable and start Fail2ban service
 systemctl enable fail2ban
 systemctl start fail2ban
 
