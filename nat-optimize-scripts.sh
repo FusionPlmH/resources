@@ -43,7 +43,7 @@ check_and_install() {
 # Check and install required packages
 check_required_packages() {
     echo "Checking required packages..."
-    local packages=("wget" "gpg" " "sed" "iproute2" "iptables")
+    local packages=("wget" "gpg" "sed" "iproute2" "iptables")
 
     for package in "${packages[@]}"; do
         check_and_install "$package"
