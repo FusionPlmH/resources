@@ -43,7 +43,7 @@ check_and_install() {
 # Check and install required packages
 check_required_packages() {
     echo "Checking required packages..."
-    local packages=("wget" "gpg" "ufw" "sed" "iproute2" "iptables")
+    local packages=("wget" "gpg" " "sed" "iproute2" "iptables")
 
     for package in "${packages[@]}"; do
         check_and_install "$package"
@@ -239,8 +239,8 @@ configure_firewall() {
 # Main function to execute all steps
 main() {
   check_required_packages
-  configure_network
-  configure_firewall
+#  configure_network
+#  configure_firewall
   ulimited_tuning
   tcp_udp_tuning
   reload_sysctl
