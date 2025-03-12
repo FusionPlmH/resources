@@ -138,8 +138,10 @@ net.ipv4.conf.default.forwarding=1
 net.ipv4.conf.default.proxy_arp=0
 net.ipv4.conf.default.send_redirects=1
 net.ipv4.conf.all.send_redirects=0
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.tun0.disable_ipv6 = 1
 fs.file-max=65535
 
 # TCP settings for performance
