@@ -68,7 +68,11 @@ fi
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 
+
 echo "Setting Up Fail2ban..."
+sudo rm -f /etc/fail2ban/jail.local
+sudo rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
+
 
 sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
 [ufw]
