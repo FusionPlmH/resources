@@ -35,13 +35,13 @@ ufw default allow outgoing
 ufw logging low
 ufw --force enable >/dev/null 2>&1
 
-## 3. Safely check and clean legacy port 443 rules
+## 3. Safely check and clean legacy port 443 rules (Strictly matching port 443)
 echo "Checking existing UFW rules for legacy entries..."
 
-if ufw status 2>/dev/null | grep -q "443"; then
+if ufw status 2>/dev/null | grep -E -q '\b443\b'; then
     echo "Found legacy 443 port rules, cleaning up..."
-    while ufw status numbered 2>/dev/null | grep -q "443"; do
-        num=$(ufw status numbered 2>/dev/null | grep "443" | head -n1 | awk -F'[][]' '{print $2}')
+    while ufw status numbered 2>/dev/null | grep -E -q '\b443\b'; do
+        num=$(ufw status numbered 2>/dev/null | grep -E '\b443\b' | head -n1 | awk -F'[][]' '{print $2}')
         if [ -n "$num" ]; then
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
