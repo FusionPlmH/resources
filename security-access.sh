@@ -73,6 +73,8 @@ else
 fi
 
 ## 5. Setup ufw
+echo "Resetting UFW rules to default..."
+ufw --force reset >/dev/null 2>&1
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
