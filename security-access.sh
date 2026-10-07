@@ -33,12 +33,12 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. Check and clean legacy port 443 rules (prevents deleting manual rules)
+## 2. Check and clean legacy port 443 rules safely
 echo "Checking existing UFW rules for legacy entries..."
 
 if ufw status | grep -q "443"; then
     echo "Found legacy 443 port rules, cleaning up..."
-    ufw status numbered | grep "443" | awk -F'[][]' '{print $2}' | sort -nr | while read -r num; do
+    ufw status numbered | (grep "443" || true) | awk -F'[][]' '{print $2}' | sort -nr | while read -r num; do
         echo "y" | ufw delete "$num" >/dev/null 2>&1 || true
     done
 fi
@@ -58,9 +58,9 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 4. Check Proxmox Virtual Environment
-if nc -z -w 2 localhost 8006 2>&1 | grep -q 'open'; then
-    echo "Proxmox Virtual Environment is installed, adding rules..."
+## 4. Check Proxmox Virtual Environment (Using Bash Native Socket)
+if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
+    echo "Proxmox Virtual Environment is active, adding rules..."
     cidr=$(ip route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
     
     if [[ -n "$cidr" ]]; then
@@ -70,10 +70,10 @@ if nc -z -w 2 localhost 8006 2>&1 | grep -q 'open'; then
         echo "vmbr0 interface not found or has no valid route, skipping Proxmox rule..."
     fi
 else
-    echo "Proxmox Virtual Environment not installed, skipping..."
+    echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
 
-## 5. Check Tailscale port
+## 5. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
     ufw allow on tailscale0
@@ -88,7 +88,6 @@ ufw logging low
 
 ## 7. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
-# Ensure log file exists before Fail2ban starts
 touch /var/log/ufw.log
 
 rm -f /etc/fail2ban/jail.local
@@ -98,7 +97,7 @@ tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
 [ufw]
 enabled = true
 filter = ufw-aggressive
-action = iptables-allports
+action = ufw
 logpath = /var/log/ufw.log
 maxretry = 5
 bantime = 7d
