@@ -33,7 +33,7 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. 检查并清理旧版本脚本遗留的 443 规则（防止误删手动添加的其他规则）
+## 2. Check and clean legacy port 443 rules (prevents deleting manual rules)
 echo "Checking existing UFW rules for legacy entries..."
 
 if ufw status | grep -q "443"; then
@@ -88,7 +88,7 @@ ufw logging low
 
 ## 7. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
-# 预先创建日志文件以防 Fail2ban 报错
+# Ensure log file exists before Fail2ban starts
 touch /var/log/ufw.log
 
 rm -f /etc/fail2ban/jail.local
