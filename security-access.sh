@@ -33,13 +33,19 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. Check and clean legacy port 443 rules safely
+## 2. Safely check and clean legacy port 443 rules (preventing index shift issues)
 echo "Checking existing UFW rules for legacy entries..."
 
-if ufw status | grep -q "443"; then
+if ufw status 2>/dev/null | grep -q "443"; then
     echo "Found legacy 443 port rules, cleaning up..."
-    ufw status numbered | (grep "443" || true) | awk -F'[][]' '{print $2}' | sort -nr | while read -r num; do
-        echo "y" | ufw delete "$num" >/dev/null 2>&1 || true
+    # Repeatedly delete port 443 rules until none remain to prevent array index shift errors
+    while ufw status numbered 2>/dev/null | grep -q "443"; do
+        num=$(ufw status numbered 2>/dev/null | grep "443" | head -n1 | awk -F'[][]' '{print $2}')
+        if [ -n "$num" ]; then
+            echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
+        else
+            break
+        fi
     done
 fi
 
@@ -61,7 +67,9 @@ fi
 ## 4. Check Proxmox Virtual Environment (Option A: Restricted to vmbr0 interface)
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, adding rules..."
-    cidr=$(ip route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+    
+    # Strictly fetch a single valid IPv4 CIDR from vmbr0
+    cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
     
     # Validate CIDR format and apply Interface-bound UFW rule
     if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
@@ -87,20 +95,30 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
 
-## 7. Setting Up Fail2ban
+## 7. Setting Up Fail2ban (Defends both UFW probes & SSH brute-force)
 echo "Setting Up Fail2ban..."
 touch /var/log/ufw.log
+touch /var/log/auth.log 2>/dev/null || true
 
 rm -f /etc/fail2ban/jail.local
 rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
 
 tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+maxretry = 5
+findtime = 1d
+bantime = 7d
+
 [ufw]
 enabled = true
 filter = ufw-aggressive
 action = ufw
 logpath = /var/log/ufw.log
 maxretry = 5
+findtime = 1d
 bantime = 7d
 EOF
 
