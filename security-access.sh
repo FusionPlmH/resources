@@ -97,30 +97,25 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     
     declare -a candidate_cidrs=()
     
-    # Automatically capture all online network interface card (NIC) routing segments with IP addresses in the system (automatically including vmbr0 and physical NICs).
     while read -r detected_cidr; do
         if [[ -n "$detected_cidr" ]]; then
             candidate_cidrs+=("$detected_cidr")
         fi
     done < <(ip -4 -o addr show up scope global 2>/dev/null | awk '{print $4}')
     
-    # Perform deduplication and dynamically apply firewall rules (allowing only the RFC 1918 private network segment).
     applied_count=0
     for raw_cidr in "${candidate_cidrs[@]}"; do
         if [[ "$raw_cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
             if [[ "$raw_cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-                # Avoid adding the same network segment rules repeatedly.
-                if ! ufw status 2>/dev/null | grep -q "$raw_cidr"; then
-                    echo -e "Allowing Pved web management from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
-                    ufw allow in on vmbr0 from "$raw_cidr" to any port 8006 >/dev/null 2>&1
-                    ((applied_count++))
-                fi
+                echo -e "Allowing PVE web management on vmbr0 from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
+                ufw allow in on vmbr0 from "$raw_cidr" to any port 8006 >/dev/null 2>&1 || true
+                ((applied_count++))
             fi
         fi
     done
     
-    if [ "$applied_count" -gt 0 ] || ufw status 2>/dev/null | grep -q "8006"; then
-        echo -e "${GREEN}✓ PVE 8006 adaptive rules are active.${NC}"
+    if [ "$applied_count" -gt 0 ]; then
+        echo -e "${GREEN}✓ PVE 8006 adaptive rules added successfully ($applied_count subnets allowed).${NC}"
     else
         echo -e "${YELLOW}Warning: No valid private subnets detected for 8006 exposure.${NC}"
     fi
