@@ -96,7 +96,6 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     applied_count=0
     vmbr0_block=$(awk '/^iface vmbr0/,/^$/' /etc/network/interfaces 2>/dev/null || true)
     
-    # 判斷 vmbr0 是實體橋接還是純內部 bridge-ports none
     if echo "$vmbr0_block" | grep -q "bridge-ports\s\+none"; then
         echo "vmbr0 is in internal mode (bridge-ports none). Finding active default gateway interface..."
         
@@ -222,16 +221,25 @@ ufw reload >/dev/null 2>&1 || true
 systemctl enable fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban >/dev/null 2>&1 || true
 
-## Enable autorun on every network reboot (Smart fallback to bridge-fd 0 if no post-down MASQUERADE exists)
+## Enable autorun specifically inside vmbr0 block after bridge-fd 0 (with fallback to post-down MASQUERADE)
 INTERFACES_FILE="/etc/network/interfaces"
 if [ -f "$INTERFACES_FILE" ]; then
     if ! grep -q "security-access.sh" "$INTERFACES_FILE"; then
-        echo "Adding auto-update post-up hook to /etc/network/interfaces..."
-        if grep -q "post-down.*MASQUERADE" "$INTERFACES_FILE"; then
+        echo "Adding auto-update post-up hook to vmbr0 in /etc/network/interfaces..."
+        if grep -q "bridge-fd 0" "$INTERFACES_FILE"; then
+            awk -v hook="        post-up    wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh" '
+                BEGIN { in_vmbr0 = 0 }
+                /^iface vmbr0/ { in_vmbr0 = 1 }
+                /^$/ { in_vmbr0 = 0 }
+                {
+                    print;
+                    if (in_vmbr0 && $0 ~ /bridge-fd 0/) {
+                        print hook;
+                    }
+                }
+            ' "$INTERFACES_FILE" > "${INTERFACES_FILE}.tmp" && mv "${INTERFACES_FILE}.tmp" "$INTERFACES_FILE"
+        elif grep -q "post-down.*MASQUERADE" "$INTERFACES_FILE"; then
             sed -i '/post-down.*MASQUERADE/a \
-        post-up    wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh' "$INTERFACES_FILE"
-        elif grep -q "bridge-fd 0" "$INTERFACES_FILE"; then
-            sed -i '/bridge-fd 0/a \
         post-up    wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh' "$INTERFACES_FILE"
         fi
     fi
