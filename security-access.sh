@@ -13,7 +13,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-## Check support and install package
+## 1. Check support and install package
 check_and_install() {
     local package=$1
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
@@ -32,7 +32,7 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 1. check Cloudflare WARP / Mesh
+## 2. check Cloudflare WARP / Mesh
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -48,7 +48,7 @@ else
 fi
 
 
-## 2. Check Proxmox Virtual Environment
+## 3. Check Proxmox Virtual Environment
 if nc -zv localhost 8006 2>&1 | grep -q 'open'; then
     echo "Proxmox Virtual Environment is installed, adding rules..."
     # 使用 ip route 直接获取 vmbr0 的真实 CIDR 网段
@@ -64,7 +64,7 @@ else
     echo "Proxmox Virtual Environment not installed, skipping..."
 fi
 
-## 3. Check Tailscale port
+## 4. Check Tailscale port
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
     ufw allow on tailscale0
@@ -72,12 +72,12 @@ else
     echo "Tailscale not installed, skipping..."
 fi
 
-## 4. Setup ufw
+## 5. Setup ufw
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
 
-## 5. Setting Up Fail2ban
+## 6. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
 rm -f /etc/fail2ban/jail.local
 rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
@@ -98,7 +98,7 @@ failregex = \[UFW BLOCK\].*SRC=<HOST> DST
 ignoreregex =
 EOF
 
-## 6. Enable UFW / Restart Fail2ban
+## 7. Enable UFW / Restart Fail2ban
 ufw --force enable
 systemctl enable fail2ban
 systemctl restart fail2ban
