@@ -58,9 +58,9 @@ else
 fi
 
 ## Check Tailscale port
-if ip a | grep -q 'tailscale0'; then
+if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
-    ufw allow in out on tailscale0
+    sudo ufw allow in out on tailscale0
 else
     echo "Tailscale not installed, skipping..."
 fi
