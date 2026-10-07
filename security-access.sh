@@ -8,9 +8,9 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}"
-echo "        Security access only for" 
-echo "     Cloudflare , Tailscale and Local"
-echo "        Welcome to use This Tool"
+echo "        Security access only for"
+echo "     Cloudflare, Tailscale and Local"
+echo "        Welcome to use this tool"
 echo "          Powered by FusionPlmH"
 echo -e "${NC}"
 
@@ -34,7 +34,7 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. Initialize and Ensure UFW is Active First
+## 2. Initialize and ensure UFW is active first
 echo "Initializing UFW policies..."
 systemctl enable ufw >/dev/null 2>&1 || true
 systemctl start ufw >/dev/null 2>&1 || true
@@ -89,25 +89,25 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Smart Routing-Based Discovery
+## 5. Check Proxmox Virtual Environment & smart routing-based discovery
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
-    echo "Proxmox Virtual Environment is active, determining active network interface via routing table..."
+    echo "Proxmox Virtual Environment is active, determining the active network interface via the routing table..."
     
     applied_count=0
     vmbr0_block=$(awk '/^iface vmbr0/,/^$/' /etc/network/interfaces 2>/dev/null || true)
     
-    # 判斷 vmbr0 是實體橋接還是純內部 bridge-ports none
+    # Determine whether vmbr0 is physically bridged or is purely internal (bridge-ports none)
     if echo "$vmbr0_block" | grep -q "bridge-ports\s\+none"; then
-        echo "vmbr0 is in internal mode (bridge-ports none). Finding active default gateway interface..."
+        echo "vmbr0 is in internal mode (bridge-ports none). Finding the active default gateway interface..."
         
-        # 核心新思路：直接從系統路由表中找出當前預設對外的網卡名稱（例如 wlp1s0f0 或 enp3s0）
+        # Core new idea: directly find the current default outbound network interface name from the system routing table
         active_iface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1 || true)
         
         if [ -z "$active_iface" ]; then
-            active_iface="wlp1s0f0" # 若取不到則預設退回你的網卡名稱
+            active_iface="wlp1s0f0" # If it cannot be detected, fall back to your default NIC name
         fi
         
-        # 自動抓取該網卡的 IP 與 CIDR 網段
+        # Automatically retrieve the IP and CIDR subnet of that interface
         iface_cidr=$(ip -4 addr show dev "$active_iface" 2>/dev/null | awk '/inet / {print $2}' | head -n1 || true)
         nat_subnet=""
         
@@ -116,7 +116,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
             nat_subnet=$(echo "$iface_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
         fi
         
-        # 如果路由介面沒抓到，退回檢查 vmbr0 自身的 IP
+        # If the routing interface cannot be detected, fall back to checking vmbr0's own IP
         if [ -z "$nat_subnet" ]; then
             vmbr0_cidr=$(ip -4 addr show dev vmbr0 2>/dev/null | awk '/inet / {print $2}' | head -n1 || true)
             if [ -n "$vmbr0_cidr" ]; then
@@ -133,7 +133,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
             echo -e "${YELLOW}Warning: Could not determine subnet for active interface.${NC}"
         fi
     else
-        # 標準橋接模式：提取 bridge-ports 後面的實體網卡
+        # Standard bridged mode: extract the physical interface after bridge-ports
         physical_port=$(echo "$vmbr0_block" | grep "bridge-ports" | awk '{print $2}' || true)
         if [ -z "$physical_port" ]; then
             physical_port="vmbr0"
@@ -177,7 +177,7 @@ else
     echo "Tailscale not installed, skipping..."
 fi
 
-## 7. Setting Up Fail2ban
+## 7. Setting up Fail2ban
 echo "Configuring Fail2ban protection..."
 touch /var/log/ufw.log >/dev/null 2>&1 || true
 
@@ -222,12 +222,12 @@ failregex = \[UFW BLOCK\].*SRC=<HOST> DST
 ignoreregex =
 EOF
 
-## 8. Reload UFW & Restart Fail2ban
+## 8. Reload UFW & restart Fail2ban
 ufw reload >/dev/null 2>&1 || true
 systemctl enable fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban >/dev/null 2>&1 || true
 
-## Enable autorun on every network reboot
+## Enable auto-run on every network reboot
 INTERFACES_FILE="/etc/network/interfaces"
 if [ -f "$INTERFACES_FILE" ]; then
     if ! grep -q "security-access.sh" "$INTERFACES_FILE"; then
