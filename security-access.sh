@@ -38,11 +38,9 @@ ufw --force enable >/dev/null 2>&1
 ## 3. Safely check and clean legacy port 443 rules (Surgical precision)
 echo "Checking existing UFW rules for legacy entries..."
 
-# Use strict matching: matches exactly " 443", " 443/tcp", or " 443 (v6)" in the port column
 if ufw status numbered 2>/dev/null | grep -E -q '\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)'; then
     echo "Found legacy 443 port rules, cleaning up..."
     while true; do
-        # Extract the exact rule number, stripping any brackets and spaces
         num=$(ufw status numbered 2>/dev/null | awk '/\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)/ {gsub(/\[|\]/,"", $1); print $1; exit}')
         if [ -n "$num" ]; then
             echo "Deleting rule number $num..."
@@ -63,7 +61,7 @@ fi
 
 if [ -n "$WARP_IF" ]; then
     echo "Cloudflare WARP/Mesh ($WARP_IF) is installed, adding rules..."
-    ufw allow on "$WARP_IF"
+    ufw allow in on "$WARP_IF"
 else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
@@ -86,7 +84,7 @@ fi
 ## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
-    ufw allow on tailscale0
+    ufw allow in on tailscale0
 else
     echo "Tailscale not installed, skipping..."
 fi
