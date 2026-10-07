@@ -60,10 +60,10 @@ if ufw status 2>/dev/null | grep -w -q "443"; then
 fi
 
 # 3.2 Cleanup unqualified 8006 rules
-if ufw status 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w -q "8006"; then
+if ufw status 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w -q "8006"; then
     echo -e "${YELLOW}Cleaning up unqualified 8006 legacy rules...${NC}"
-    while ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w "8006" | grep -q "\["; do
-        num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
+    while ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w "8006" | grep -q "\["; do
+        num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
@@ -89,36 +89,77 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Fully Adaptive Subnet Discovery
+## 5. Check Proxmox Virtual Environment & Smart Routing-Based Discovery
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
-    echo "Proxmox Virtual Environment is active, scanning active private subnets..."
-    
-    target_interface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
-    if [ -z "$target_interface" ]; then
-        target_interface="vmbr0"
-    fi
-    echo -n "Using target network interface for 8006 rule: "
-    echo -e "${GREEN}${target_interface}${NC}"
+    echo "Proxmox Virtual Environment is active, determining active network interface via routing table..."
     
     applied_count=0
-    ips=$(ip -4 addr show dev "$target_interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || true)
-    for local_ip in $ips; do
-        if [[ -n "$local_ip" ]]; then
-            subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
-            if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-                echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
-                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
-                applied_count=$((applied_count + 1))
+    vmbr0_block=$(awk '/^iface vmbr0/,/^$/' /etc/network/interfaces 2>/dev/null || true)
+    
+    # 判斷 vmbr0 是實體橋接還是純內部 bridge-ports none
+    if echo "$vmbr0_block" | grep -q "bridge-ports\s\+none"; then
+        echo "vmbr0 is in internal mode (bridge-ports none). Finding active default gateway interface..."
+        
+        # 核心新思路：直接從系統路由表中找出當前預設對外的網卡名稱（例如 wlp1s0f0 或 enp3s0）
+        active_iface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1 || true)
+        
+        if [ -z "$active_iface" ]; then
+            active_iface="wlp1s0f0" # 若取不到則預設退回你的網卡名稱
+        fi
+        
+        # 自動抓取該網卡的 IP 與 CIDR 網段
+        iface_cidr=$(ip -4 addr show dev "$active_iface" 2>/dev/null | awk '/inet / {print $2}' | head -n1 || true)
+        nat_subnet=""
+        
+        if [ -n "$iface_cidr" ]; then
+            iface_ip=$(echo "$iface_cidr" | cut -d/ -f1)
+            nat_subnet=$(echo "$iface_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
+        fi
+        
+        # 如果路由介面沒抓到，退回檢查 vmbr0 自身的 IP
+        if [ -z "$nat_subnet" ]; then
+            vmbr0_cidr=$(ip -4 addr show dev vmbr0 2>/dev/null | awk '/inet / {print $2}' | head -n1 || true)
+            if [ -n "$vmbr0_cidr" ]; then
+                vmbr0_ip=$(echo "$vmbr0_cidr" | cut -d/ -f1)
+                nat_subnet=$(echo "$vmbr0_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
             fi
         fi
-    done
-    
-    echo -e "Allowing PVE web management on internal bridge: ${GREEN}10.10.10.0/24${NC}..."
-    ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 >/dev/null 2>&1 || true
-    applied_count=$((applied_count + 1))
+        
+        if [ -n "$nat_subnet" ]; then
+            echo -e "Detected active interface: ${GREEN}$active_iface${NC}, Subnet: ${GREEN}$nat_subnet${NC}"
+            ufw allow in on "$active_iface" from "$nat_subnet" to any port 8006 >/dev/null 2>&1 || true
+            applied_count=$((applied_count + 1))
+        else
+            echo -e "${YELLOW}Warning: Could not determine subnet for active interface.${NC}"
+        fi
+    else
+        # 標準橋接模式：提取 bridge-ports 後面的實體網卡
+        physical_port=$(echo "$vmbr0_block" | grep "bridge-ports" | awk '{print $2}' || true)
+        if [ -z "$physical_port" ]; then
+            physical_port="vmbr0"
+        fi
+        echo -e "vmbr0 has physical binding (${GREEN}$physical_port${NC}). Extracting CIDR from this interface..."
+        
+        ips=$(ip -4 addr show dev "$physical_port" 2>/dev/null | awk '/inet / {print $2}' || true)
+        if [ -z "$ips" ]; then
+            ips=$(ip -4 addr show dev vmbr0 2>/dev/null | awk '/inet / {print $2}' || true)
+        fi
+        
+        for cidr in $ips; do
+            if [[ -n "$cidr" ]]; then
+                local_ip=$(echo "$cidr" | cut -d/ -f1)
+                subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
+                if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
+                    echo -e "Allowing PVE web management on ${GREEN}$physical_port${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
+                    ufw allow in on "$physical_port" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
+                    applied_count=$((applied_count + 1))
+                fi
+            fi
+        done
+    fi
 
     if [ "$applied_count" -gt 0 ]; then
-        echo -e "${GREEN}✓ PVE 8006 adaptive rules applied ($applied_count subnets).${NC}"
+        echo -e "${GREEN}✓ PVE 8006 adaptive rules applied successfully.${NC}"
     else
         echo -e "${YELLOW}Warning: No valid private subnets detected for 8006 exposure.${NC}"
     fi
@@ -187,7 +228,6 @@ systemctl enable fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban >/dev/null 2>&1 || true
 
 ## Enable autorun on every network reboot
-echo "Enable autorun this script on every network reboot..."
 INTERFACES_FILE="/etc/network/interfaces"
 if [ -f "$INTERFACES_FILE" ]; then
     if ! grep -q "security-access.sh" "$INTERFACES_FILE"; then
