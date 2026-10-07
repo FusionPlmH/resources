@@ -5,7 +5,7 @@ echo ""
 echo "        Security access only for" 
 echo "     Cloudflare , Tailscale and Local"
 echo "        Welcome to use This Tool"
-echo "         Powered by FsuionPlmH"
+echo "         Powered by FuionPlmH"
 echo ""
 
 # 0. Permission check
