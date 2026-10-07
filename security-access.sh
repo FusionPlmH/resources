@@ -95,8 +95,14 @@ fi
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, scanning active private subnets..."
     
-    declare -a candidate_cidrs=()
+    # Automatically capture the name of the external physical network interface card (such as wlp1s0f0 or the default routing interface).
+    target_interface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+    if [ -z "$target_interface" ]; then
+        target_interface="vmbr0" # 
+    fi
+    echo "Using target network interface for 8006 rule: ${GREEN}$target_interface${NC}"
     
+    declare -a candidate_cidrs=()
     while read -r detected_cidr; do
         if [[ -n "$detected_cidr" ]]; then
             candidate_cidrs+=("$detected_cidr")
@@ -107,8 +113,8 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     for raw_cidr in "${candidate_cidrs[@]}"; do
         if [[ "$raw_cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
             if [[ "$raw_cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-                echo -e "Allowing PVE web management on vmbr0 from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
-                ufw allow in on vmbr0 from "$raw_cidr" to any port 8006 >/dev/null 2>&1 || true
+                echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
+                ufw allow in on "$target_interface" from "$raw_cidr" to any port 8006 >/dev/null 2>&1 || true
                 ((applied_count++))
             fi
         fi
@@ -122,6 +128,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
+
 
 ## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
