@@ -36,10 +36,12 @@ check_and_install fail2ban
 
 ## 2. Initialize and Ensure UFW is Active First
 echo "Initializing UFW default policies and enabling firewall..."
-ufw default deny incoming >/dev/null 2>&1
-ufw default allow outgoing >/dev/null 2>&1
-ufw logging low >/dev/null 2>&1
-ufw --force enable >/dev/null 2>&1
+systemctl enable ufw >/dev/null 2>&1 || true
+systemctl start ufw >/dev/null 2>&1 || true
+ufw default deny incoming >/dev/null 2>&1 || true
+ufw default allow outgoing >/dev/null 2>&1 || true
+ufw logging low >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
 
 ## 3. Safely check and clean legacy port rules (443 & unqualified 8006)
 echo "Checking existing UFW rules for legacy entries..."
@@ -89,43 +91,48 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Smart Private CIDR
+## 5. Check Proxmox Virtual Environment & Smart Interface CIDR Extraction
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
-    echo "Proxmox Virtual Environment is active, checking management network..."
+    echo "Proxmox Virtual Environment is active, parsing vmbr0 network configuration..."
     
+    target_dev=""
     cidr=""
     
-    # Strategy 1: Prioritize obtaining the routing network segment from vmbr0.
-    cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
-    
-    # Strategy 2: If vmbr0 fails to detect the network interface card (NIC), automatically search for the currently connected physical network card via the default gateway.
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        # Find the physical network interface name corresponding to the preset route (e.g., wlp1s0f0 or end0).
-        primary_dev=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1 || true)
+    # 5.1 Parse /etc/network/interfaces for vmbr0 configuration
+    if [ -f /etc/network/interfaces ]; then
+        bridge_val=$(awk '/^iface vmbr0/,/^iface|^auto|^mapping/ {if ($1=="bridge-ports") print $2}' /etc/network/interfaces | head -n1)
         
-        if [ -n "$primary_dev" ]; then
-            echo "Detected active physical interface: $primary_dev"
-            cidr=$(ip -4 route show dev "$primary_dev" 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
-        fi
-    fi
-    
-    # Strategy 3: As a last resort, exclude virtual and VPN network cards, and find the first active private network segment.
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        cidr=$(ip -4 -o addr show up scope global | grep -vE '^(lo|vmbr|tailscale|warp|tun|tap|docker|br-)' | awk '{print $4}' | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1]))' | head -n1 || true)
-    fi
-    
-    # Final verification and application of firewall rules
-    if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        if [[ "$cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-            echo -e "Allowing PVE web management from private CIDR: ${GREEN}$cidr${NC}..."
-            # Allow 8006 for vmbr0 or its corresponding network interface card.
-            ufw allow in on vmbr0 from "$cidr" to any port 8006 >/dev/null 2>&1
-            echo -e "${GREEN}✓ PVE 8006 rule added successfully.${NC}"
+        if [ -n "$bridge_val" ] && [ "$bridge_val" != "none" ]; then
+            target_dev="$bridge_val"
+            echo "Found bridge-ports device: $target_dev"
         else
-            echo -e "${YELLOW}Warning: Detected CIDR ($cidr) is a Public IP. Skipping 8006 exposure for security.${NC}"
+            echo "bridge-ports is set to 'none', checking iptables rules in vmbr0..."
+            iptables_line=$(awk '/^iface vmbr0/,/^iface|^auto|^mapping/ {if ($1=="post-up" && $0~/iptables/) print $0}' /etc/network/interfaces | head -n1)
+            
+            if [ -n "$iptables_line" ]; then
+                target_dev=$(echo "$iptables_line" | sed -E 's/.*-o[[:space:]]+([a-zA-Z0-9_-]+).*/\1/')
+                echo "Extracted physical interface from iptables rule: $target_dev"
+            fi
         fi
+    fi
+    
+    # 5.2 Retrieve CIDR using the extracted physical device
+    if [ -n "$target_dev" ] && ip link show "$target_dev" >/dev/null 2>&1; then
+        cidr=$(ip -4 route show dev "$target_dev" 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+    fi
+    
+    # 5.3 Fallback to vmbr0 routing if needed
+    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+    fi
+    
+    # 5.4 Validate CIDR and apply UFW rule
+    if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        echo -e "Allowing PVE web management on vmbr0 from derived CIDR: ${GREEN}$cidr${NC}..."
+        ufw allow in on vmbr0 from "$cidr" to any port 8006 >/dev/null 2>&1
+        echo -e "${GREEN}✓ PVE 8006 rule added successfully.${NC}"
     else
-        echo -e "${YELLOW}Valid private CIDR not detected, skipping Proxmox rule...${NC}"
+        echo -e "${YELLOW}Valid CIDR could not be determined automatically, skipping Proxmox rule...${NC}"
     fi
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
