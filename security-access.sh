@@ -25,7 +25,7 @@ check_and_install() {
     local package=$1
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
         echo -e "Installing ${YELLOW}$package${NC}..."
-        apt-get update -qq && apt-get install -y -qq "$package"
+        apt-get update -qq && apt-get install -y -qq "$package" >/dev/null 2>&1
     else
         echo -e "${GREEN}$package${NC} is already installed."
     fi
@@ -35,39 +35,37 @@ check_and_install ufw
 check_and_install fail2ban
 
 ## 2. Initialize and Ensure UFW is Active First
-echo "Initializing UFW default policies and enabling firewall..."
-systemctl enable ufw || true
-systemctl start ufw || true
-ufw default deny incoming || true
-ufw default allow outgoing || true
-ufw logging low || true
-ufw --force enable || true
+echo "Initializing UFW policies..."
+systemctl enable ufw >/dev/null 2>&1 || true
+systemctl start ufw >/dev/null 2>&1 || true
+ufw default deny incoming >/dev/null 2>&1 || true
+ufw default allow outgoing >/dev/null 2>&1 || true
+ufw logging low >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
 
 ## 3. Safely check and clean legacy port rules (443 & unqualified 8006)
 echo "Checking existing UFW rules for legacy entries..."
 
 # 3.1 Cleanup legacy 443 rules
 if ufw status 2>/dev/null | grep -w -q "443"; then
-    echo -e "${YELLOW}Found legacy 443 port rules, cleaning up...${NC}"
+    echo -e "${YELLOW}Cleaning up legacy 443 rules...${NC}"
     while ufw status numbered 2>/dev/null | grep -w "443" | grep -q "\["; do
         num=$(ufw status numbered 2>/dev/null | grep -w "443" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
-            echo "Deleting 443 rule #$num..."
-            echo "y" | ufw delete "$num" || break
+            echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
             break
         fi
     done
 fi
 
-# 3.2 Cleanup unqualified 8006 rules (rules not tied to vmbr0 or physical interface)
+# 3.2 Cleanup unqualified 8006 rules
 if ufw status 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w -q "8006"; then
-    echo -e "${YELLOW}Found unqualified 8006 legacy rules, cleaning up...${NC}"
+    echo -e "${YELLOW}Cleaning up unqualified 8006 legacy rules...${NC}"
     while ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w "8006" | grep -q "\["; do
         num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -v "on wlp" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
-            echo "Deleting unqualified 8006 rule #$num..."
-            echo "y" | ufw delete "$num" || break
+            echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
             break
         fi
@@ -83,10 +81,10 @@ elif ip link show warp0 >/dev/null 2>&1; then
 fi
 
 if [ -n "$WARP_IF" ]; then
-    echo -e "Cloudflare WARP/Mesh (${GREEN}$WARP_IF${NC}) is installed, adding rules..."
-    ufw allow in on "$WARP_IF" to any || true
-    ufw allow out on "$WARP_IF" to any || true
-    echo -e "${GREEN}✓ Cloudflare WARP rules added successfully.${NC}"
+    echo -e "Configuring Cloudflare WARP/Mesh (${GREEN}$WARP_IF${NC})..."
+    ufw allow in on "$WARP_IF" to any >/dev/null 2>&1 || true
+    ufw allow out on "$WARP_IF" to any >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓ Cloudflare WARP rules applied.${NC}"
 else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
@@ -109,18 +107,18 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
             subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
             if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
                 echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
-                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 || true
+                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
                 applied_count=$((applied_count + 1))
             fi
         fi
     done
     
     echo -e "Allowing PVE web management on internal bridge: ${GREEN}10.10.10.0/24${NC}..."
-    ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 || true
+    ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 >/dev/null 2>&1 || true
     applied_count=$((applied_count + 1))
 
     if [ "$applied_count" -gt 0 ]; then
-        echo -e "${GREEN}✓ PVE 8006 adaptive rules added successfully ($applied_count subnets allowed).${NC}"
+        echo -e "${GREEN}✓ PVE 8006 adaptive rules applied ($applied_count subnets).${NC}"
     else
         echo -e "${YELLOW}Warning: No valid private subnets detected for 8006 exposure.${NC}"
     fi
@@ -130,17 +128,17 @@ fi
 
 ## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
-    echo -e "Tailscale is installed, adding rules..."
-    ufw allow in on tailscale0 to any || true
-    ufw allow out on tailscale0 to any || true
-    echo -e "${GREEN}✓ Tailscale rules added successfully.${NC}"
+    echo -e "Configuring Tailscale rules..."
+    ufw allow in on tailscale0 to any >/dev/null 2>&1 || true
+    ufw allow out on tailscale0 to any >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓ Tailscale rules applied.${NC}"
 else
     echo "Tailscale not installed, skipping..."
 fi
 
-## 7. Setting Up Fail2ban (Enhanced for SSH & Proxmox 8006 Protection)
-echo "Setting Up Fail2ban with Advanced SSH & PVE Protection..."
-touch /var/log/ufw.log || true
+## 7. Setting Up Fail2ban
+echo "Configuring Fail2ban protection..."
+touch /var/log/ufw.log >/dev/null 2>&1 || true
 
 tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
 [sshd]
@@ -184,21 +182,18 @@ ignoreregex =
 EOF
 
 ## 8. Reload UFW & Restart Fail2ban
-echo "Reloading firewall and restarting Fail2ban..."
-ufw reload || true
-systemctl enable fail2ban || true
-systemctl restart fail2ban || true
+ufw reload >/dev/null 2>&1 || true
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban >/dev/null 2>&1 || true
 
 ## Enable autorun on every network reboot
+echo "Enable autorun this script on every network reboot..."
 INTERFACES_FILE="/etc/network/interfaces"
 if [ -f "$INTERFACES_FILE" ]; then
     if ! grep -q "security-access.sh" "$INTERFACES_FILE"; then
         echo "Adding auto-update post-up hook to /etc/network/interfaces..."
         sed -i '/post-down iptables.*MASQUERADE/a \
         post-up    wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh' "$INTERFACES_FILE"
-        echo -e "${GREEN}✓ Auto-update post-up hook successfully added!${NC}"
-    else
-        echo "Auto-update post-up hook already exists in $INTERFACES_FILE, skipping insertion."
     fi
 fi
 
