@@ -35,14 +35,17 @@ ufw default allow outgoing
 ufw logging low
 ufw --force enable >/dev/null 2>&1
 
-## 3. Safely check and clean legacy port 443 rules (Strictly matching port 443)
+## 3. Safely check and clean legacy port 443 rules (Surgical precision)
 echo "Checking existing UFW rules for legacy entries..."
 
-if ufw status 2>/dev/null | grep -E -q '\b443\b'; then
+# Use strict matching: matches exactly " 443", " 443/tcp", or " 443 (v6)" in the port column
+if ufw status numbered 2>/dev/null | grep -E -q '\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)'; then
     echo "Found legacy 443 port rules, cleaning up..."
-    while ufw status numbered 2>/dev/null | grep -E -q '\b443\b'; do
-        num=$(ufw status numbered 2>/dev/null | grep -E '\b443\b' | head -n1 | awk -F'[][]' '{print $2}')
+    while true; do
+        # Extract the exact rule number, stripping any brackets and spaces
+        num=$(ufw status numbered 2>/dev/null | awk '/\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)/ {gsub(/\[|\]/,"", $1); print $1; exit}')
         if [ -n "$num" ]; then
+            echo "Deleting rule number $num..."
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
             break
@@ -97,6 +100,7 @@ tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
 enabled = true
 port = ssh
 filter = sshd
+backend = systemd
 maxretry = 5
 findtime = 1d
 bantime = 7d
