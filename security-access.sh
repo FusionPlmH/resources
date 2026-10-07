@@ -114,4 +114,11 @@ ufw --force enable
 systemctl enable fail2ban
 systemctl restart fail2ban
 
+echo ""
+echo "=================================================="
+echo "Current active UFW rules (including manual rules):"
+echo "=================================================="
+ufw status verbose
+
+echo ""
 echo "Security rules setup completed successfully."
