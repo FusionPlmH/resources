@@ -6,6 +6,7 @@ echo "        Security access only for"
 echo "     Cloudflare , Tailscale and Local"
 echo "        Welcome to use This Tool"
 echo "         Powered by FsuionPlmH"
+echo ""
 
 # 0. Permission check
 if [ "$EUID" -ne 0 ]; then
@@ -32,8 +33,9 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. Reset UFW
-echo "Checking existing UFW rules for legacy or conflicting entries..."
+## 2. 检查并清理旧版本脚本遗留的 443 规则（防止误删手动添加的其他规则）
+echo "Checking existing UFW rules for legacy entries..."
+
 if ufw status | grep -q "443"; then
     echo "Found legacy 443 port rules, cleaning up..."
     ufw status numbered | grep "443" | awk -F'[][]' '{print $2}' | sort -nr | while read -r num; do
@@ -41,7 +43,7 @@ if ufw status | grep -q "443"; then
     done
 fi
 
-## 3. check Cloudflare WARP / Mesh
+## 3. Check Cloudflare WARP / Mesh
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -56,11 +58,9 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-
 ## 4. Check Proxmox Virtual Environment
-if nc -zv localhost 8006 2>&1 | grep -q 'open'; then
+if nc -z -w 2 localhost 8006 2>&1 | grep -q 'open'; then
     echo "Proxmox Virtual Environment is installed, adding rules..."
-    # 使用 ip route 直接获取 vmbr0 的真实 CIDR 网段
     cidr=$(ip route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
     
     if [[ -n "$cidr" ]]; then
@@ -81,15 +81,16 @@ else
     echo "Tailscale not installed, skipping..."
 fi
 
-## 6. Setup ufw
-echo "Resetting UFW rules to default..."
-ufw --force reset >/dev/null 2>&1
+## 6. Setup UFW defaults and logging
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
 
 ## 7. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
+# 预先创建日志文件以防 Fail2ban 报错
+touch /var/log/ufw.log
+
 rm -f /etc/fail2ban/jail.local
 rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
 
