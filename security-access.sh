@@ -51,7 +51,7 @@ if ufw status numbered 2>/dev/null | grep -E -q '\][[:space:]]+443(\/tcp|\/udp|[
     done
 fi
 
-## 4. Check Cloudflare WARP / Mesh
+## 4. Check Cloudflare WARP / Mesh (Explicit In & Out)
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -62,6 +62,7 @@ fi
 if [ -n "$WARP_IF" ]; then
     echo "Cloudflare WARP/Mesh ($WARP_IF) is installed, adding rules..."
     ufw allow in on "$WARP_IF"
+    ufw allow out on "$WARP_IF"
 else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
@@ -81,10 +82,11 @@ else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
 
-## 6. Check Tailscale interface
+## 6. Check Tailscale interface (Explicit In & Out)
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
     ufw allow in on tailscale0
+    ufw allow out on tailscale0
 else
     echo "Tailscale not installed, skipping..."
 fi
