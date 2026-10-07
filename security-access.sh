@@ -35,15 +35,15 @@ ufw default allow outgoing
 ufw logging low
 ufw --force enable >/dev/null 2>&1
 
-## 3. Safely check and clean legacy port 443 rules (Surgical precision)
+## 3. Safely check and clean legacy port 443 rules (100% Guaranteed Cleanup)
 echo "Checking existing UFW rules for legacy entries..."
 
-if ufw status numbered 2>/dev/null | grep -E -q '\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)'; then
+if ufw status 2>/dev/null | grep -w -q "443"; then
     echo "Found legacy 443 port rules, cleaning up..."
-    while true; do
-        num=$(ufw status numbered 2>/dev/null | awk '/\][[:space:]]+443(\/tcp|\/udp|[[:space:]]|$)/ {gsub(/\[|\]/,"", $1); print $1; exit}')
+    while ufw status numbered 2>/dev/null | grep -w "443" | grep -q "\["; do
+        num=$(ufw status numbered 2>/dev/null | grep -w "443" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
-            echo "Deleting rule number $num..."
+            echo "Deleting 443 rule #$num..."
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
             break
@@ -51,7 +51,7 @@ if ufw status numbered 2>/dev/null | grep -E -q '\][[:space:]]+443(\/tcp|\/udp|[
     done
 fi
 
-## 4. Check Cloudflare WARP / Mesh (Explicit In & Out)
+## 4. Check Cloudflare WARP / Mesh
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -61,8 +61,8 @@ fi
 
 if [ -n "$WARP_IF" ]; then
     echo "Cloudflare WARP/Mesh ($WARP_IF) is installed, adding rules..."
-    ufw allow in on "$WARP_IF"
-    ufw allow out on "$WARP_IF"
+    ufw allow in on "$WARP_IF" to any
+    ufw allow out on "$WARP_IF" to any
 else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
@@ -82,11 +82,11 @@ else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
 
-## 6. Check Tailscale interface (Explicit In & Out)
+## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
-    ufw allow in on tailscale0
-    ufw allow out on tailscale0
+    ufw allow in on tailscale0 to any
+    ufw allow out on tailscale0 to any
 else
     echo "Tailscale not installed, skipping..."
 fi
