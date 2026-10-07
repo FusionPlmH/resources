@@ -133,8 +133,8 @@ else
     echo "Tailscale not installed, skipping..."
 fi
 
-## 7. Setting Up Fail2ban
-echo "Setting Up Fail2ban..."
+## 7. Setting Up Fail2ban (Enhanced for SSH & Proxmox 8006 Protection)
+echo "Setting Up Fail2ban with Advanced SSH & PVE Protection..."
 touch /var/log/ufw.log
 
 tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
@@ -147,6 +147,15 @@ maxretry = 5
 findtime = 1d
 bantime = 7d
 
+[proxmox]
+enabled = true
+port = https,http,8006
+filter = proxmox
+backend = systemd
+maxretry = 3
+findtime = 1d
+bantime = 7d
+
 [ufw]
 enabled = true
 filter = ufw-aggressive
@@ -155,6 +164,12 @@ logpath = /var/log/ufw.log
 maxretry = 5
 findtime = 1d
 bantime = 7d
+EOF
+
+tee /etc/fail2ban/filter.d/proxmox.conf > /dev/null <<'EOF'
+[Definition]
+failregex = pveproxy\[.*authentication failure; rhost=<HOST>.*
+ignoreregex =
 EOF
 
 tee /etc/fail2ban/filter.d/ufw-aggressive.conf > /dev/null <<'EOF'
