@@ -101,7 +101,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
         if [[ -n "$detected_cidr" ]]; then
             candidate_cidrs+=("$detected_cidr")
         fi
-    done < <(ip -4 -o addr show up scope global 2>/dev/null | awk '{print $4}')
+    done < <(ip -4 route show scope global 2>/dev/null | awk '{print $1}')
     
     applied_count=0
     for raw_cidr in "${candidate_cidrs[@]}"; do
