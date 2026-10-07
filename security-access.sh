@@ -43,7 +43,7 @@ ufw default allow outgoing >/dev/null 2>&1 || true
 ufw logging low >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 
-## 3. Safely check and clean legacy port rules (443 & unqualified 8006)
+## 3. Safely check and clean legacy port rules (443 & unqualified 8006/ssh)
 echo "Checking existing UFW rules for legacy entries..."
 
 # 3.1 Cleanup legacy 443 rules
@@ -59,11 +59,11 @@ if ufw status 2>/dev/null | grep -w -q "443"; then
     done
 fi
 
-# 3.2 Cleanup unqualified 8006 rules
-if ufw status 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w -q "8006"; then
+# 3.2 Cleanup broad/unqualified 8006 rules (keeping interface-specific ones)
+if ufw status 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -v "on tailscale" | grep -w -q "8006"; then
     echo -e "${YELLOW}Cleaning up unqualified 8006 legacy rules...${NC}"
-    while ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w "8006" | grep -q "\["; do
-        num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
+    while ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -v "on tailscale" | grep -w "8006" | grep -q "\["; do
+        num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr" | grep -v "on wlp" | grep -v "on tailscale" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
@@ -89,7 +89,7 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Smart Routing-Based Discovery
+## 5. Check Proxmox Virtual Environment & Smart Routing-Based Discovery (Restricted to 8006 & SSH)
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, determining active network interface via routing table..."
     
@@ -122,7 +122,9 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
         
         if [ -n "$nat_subnet" ]; then
             echo -e "Detected active interface: ${GREEN}$active_iface${NC}, Subnet: ${GREEN}$nat_subnet${NC}"
-            ufw allow in on "$active_iface" from "$nat_subnet" to any port 8006 >/dev/null 2>&1 || true
+            # 清晰限制內網僅允許 8006 與 ssh
+            ufw allow in on "$active_iface" from "$nat_subnet" to any port 8006 proto tcp >/dev/null 2>&1 || true
+            ufw allow in on "$active_iface" from "$nat_subnet" to any port ssh proto tcp >/dev/null 2>&1 || true
             applied_count=$((applied_count + 1))
         else
             echo -e "${YELLOW}Warning: Could not determine subnet for active interface.${NC}"
@@ -144,8 +146,9 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
                 local_ip=$(echo "$cidr" | cut -d/ -f1)
                 subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
                 if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-                    echo -e "Allowing PVE web management on ${GREEN}$physical_port${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
-                    ufw allow in on "$physical_port" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
+                    echo -e "Allowing PVE web/ssh management on ${GREEN}$physical_port${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
+                    ufw allow in on "$physical_port" from "$subnet_prefix" to any port 8006 proto tcp >/dev/null 2>&1 || true
+                    ufw allow in on "$physical_port" from "$subnet_prefix" to any port ssh proto tcp >/dev/null 2>&1 || true
                     applied_count=$((applied_count + 1))
                 fi
             fi
@@ -153,20 +156,21 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     fi
 
     if [ "$applied_count" -gt 0 ]; then
-        echo -e "${GREEN}✓ PVE 8006 adaptive rules applied successfully.${NC}"
+        echo -e "${GREEN}✓ PVE adaptive rules (8006 & SSH) applied successfully.${NC}"
     else
-        echo -e "${YELLOW}Warning: No valid private subnets detected for 8006 exposure.${NC}"
+        echo -e "${YELLOW}Warning: No valid private subnets detected for management exposure.${NC}"
     fi
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
 
-## 6. Check Tailscale interface
+## 6. Check Tailscale interface (Explicitly restricted to 8006 and SSH)
 if ip link show tailscale0 >/dev/null 2>&1; then
-    echo -e "Configuring Tailscale rules..."
-    ufw allow in on tailscale0 to any >/dev/null 2>&1 || true
+    echo -e "Configuring Tailscale rules (restricted to 8006 and SSH)..."
+    ufw allow in on tailscale0 to any port 8006 proto tcp >/dev/null 2>&1 || true
+    ufw allow in on tailscale0 to any port ssh proto tcp >/dev/null 2>&1 || true
     ufw allow out on tailscale0 to any >/dev/null 2>&1 || true
-    echo -e "${GREEN}✓ Tailscale rules applied.${NC}"
+    echo -e "${GREEN}✓ Tailscale restricted rules applied.${NC}"
 else
     echo "Tailscale not installed, skipping..."
 fi
