@@ -33,8 +33,13 @@ check_and_install ufw
 check_and_install fail2ban
 
 ## 2. Reset UFW
-echo "Resetting previous UFW rules to ensure clean setup..."
-ufw --force reset >/dev/null 2>&1
+echo "Checking existing UFW rules for legacy or conflicting entries..."
+if ufw status | grep -q "443"; then
+    echo "Found legacy 443 port rules, cleaning up..."
+    ufw status numbered | grep "443" | awk -F'[][]' '{print $2}' | sort -nr | while read -r num; do
+        echo "y" | ufw delete "$num" >/dev/null 2>&1 || true
+    done
+fi
 
 ## 3. check Cloudflare WARP / Mesh
 WARP_IF=""
