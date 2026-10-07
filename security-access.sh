@@ -89,22 +89,43 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Private CIDR
+## 5. Check Proxmox Virtual Environment & Smart Private CIDR
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, checking management network..."
+    
+    cidr=""
+    
+    # Strategy 1: Prioritize obtaining the routing network segment from vmbr0.
     cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
     
+    # Strategy 2: If vmbr0 fails to detect the network interface card (NIC), automatically search for the currently connected physical network card via the default gateway.
+    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        # Find the physical network interface name corresponding to the preset route (e.g., wlp1s0f0 or end0).
+        primary_dev=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1 || true)
+        
+        if [ -n "$primary_dev" ]; then
+            echo "Detected active physical interface: $primary_dev"
+            cidr=$(ip -4 route show dev "$primary_dev" 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+        fi
+    fi
+    
+    # Strategy 3: As a last resort, exclude virtual and VPN network cards, and find the first active private network segment.
+    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        cidr=$(ip -4 -o addr show up scope global | grep -vE '^(lo|vmbr|tailscale|warp|tun|tap|docker|br-)' | awk '{print $4}' | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1]))' | head -n1 || true)
+    fi
+    
+    # Final verification and application of firewall rules
     if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        # Strict Private IP verification (RFC 1918)
         if [[ "$cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-            echo -e "Allowing PVE web management on vmbr0 from private CIDR: ${GREEN}$cidr${NC}..."
+            echo -e "Allowing PVE web management from private CIDR: ${GREEN}$cidr${NC}..."
+            # Allow 8006 for vmbr0 or its corresponding network interface card.
             ufw allow in on vmbr0 from "$cidr" to any port 8006 >/dev/null 2>&1
             echo -e "${GREEN}✓ PVE 8006 rule added successfully.${NC}"
         else
-            echo -e "${YELLOW}Warning: vmbr0 CIDR ($cidr) is a Public IP. Skipping 8006 exposure for security.${NC}"
+            echo -e "${YELLOW}Warning: Detected CIDR ($cidr) is a Public IP. Skipping 8006 exposure for security.${NC}"
         fi
     else
-        echo -e "${YELLOW}Valid private CIDR on vmbr0 not detected, skipping Proxmox rule...${NC}"
+        echo -e "${YELLOW}Valid private CIDR not detected, skipping Proxmox rule...${NC}"
     fi
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
