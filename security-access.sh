@@ -3,17 +3,23 @@ set -euo pipefail
 
 echo ""
 echo "        Security access only for" 
-echo "Cloudflared Tunnel, Tailscale and Local"
+echo "     Cloudflare , Tailscale and Local"
 echo "        Welcome to use This Tool"
 echo "         Powered by FsuionPlmH"
 
+# 0. Permission check
+if [ "$EUID" -ne 0 ]; then
+  echo "Error: Please run this script with root privileges (e.g. sudo)."
+  exit 1
+fi
+
 ## Check support and install package
 check_and_install() {
-    package=$1
+    local package=$1
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
         if grep -Eqi "debian|ubuntu" /etc/issue* /proc/version* /etc/os-release*; then
             echo "Your system is supported. Now installing $package..."
-            sudo apt update && sudo apt install -y "$package"
+            apt-get update -qq && apt-get install -y -qq "$package"
         else
             echo "$package not supported on this system."
             exit 1
@@ -26,23 +32,7 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## Check Cloudflared
-if command -v cloudflared >/dev/null 2>&1; then
-    if systemctl is-active --quiet cloudflared; then
-        echo "Cloudflared has been installed, adding rules..."
-        # 使用空格分隔 curl 输出的多个 IP
-        for line in $(curl -s https://www.cloudflare.com/ips-v4) $(curl -s https://www.cloudflare.com/ips-v6); do
-            ufw allow from "$line" to any port 443
-        done
-    else
-        echo "Cloudflared installed but not active. Skipping rule addition..."
-    fi
-else
-    echo "Cloudflared not installed, skipping..."
-fi
-
-# 2. 检查并配置 Cloudflare WARP / Mesh
-# 说明：Cloudflare WARP 在 Linux 上创建的接口一般为 CloudflareWARP 或 warp0
+## 1. check Cloudflare WARP / Mesh
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -52,45 +42,47 @@ fi
 
 if [ -n "$WARP_IF" ]; then
     echo "Cloudflare WARP/Mesh ($WARP_IF) is installed, adding rules..."
-    ufw allow in out on "$WARP_IF"
+    ufw allow on "$WARP_IF"
 else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## Check Proxmox Virtual Environment
+
+## 2. Check Proxmox Virtual Environment
 if nc -zv localhost 8006 2>&1 | grep -q 'open'; then
     echo "Proxmox Virtual Environment is installed, adding rules..."
-    pve_ip_address=$(ip -4 addr show vmbr0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
-    if [[ -n "$pve_ip_address" ]] && ( [[ $pve_ip_address =~ ^10\. ]] || [[ $pve_ip_address =~ ^172\.1[6-9]\. ]] || [[ $pve_ip_address =~ ^172\.2[0-9]\. ]] || [[ $pve_ip_address =~ ^172\.3[0-1]\. ]] || [[ $pve_ip_address =~ ^192\.168\. ]] ); then
-        prefix=$(ip -o -f inet addr show dev vmbr0 | awk '{print $4}' | cut -d '/' -f2)
-        ip_range=$(ip -o -f inet addr show dev vmbr0 | awk '{print $4}' | cut -d '/' -f1 | awk -F. '{OFS="."; $4=0; print}')
-        cidr="$ip_range/$prefix"
+    # 使用 ip route 直接获取 vmbr0 的真实 CIDR 网段
+    cidr=$(ip route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+    
+    if [[ -n "$cidr" ]]; then
+        echo "Allowing PVE web management on $cidr..."
         ufw allow from "$cidr" to any port 8006
     else
-        echo "vmbr0 interface not found or IP is out of expected range, skipping Proxmox rule..."
+        echo "vmbr0 interface not found or has no valid route, skipping Proxmox rule..."
     fi
 else
     echo "Proxmox Virtual Environment not installed, skipping..."
 fi
 
-## Check Tailscale port
+## 3. Check Tailscale port
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
-    sudo ufw allow in out on tailscale0
+    ufw allow on tailscale0
 else
     echo "Tailscale not installed, skipping..."
 fi
 
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
+## 4. Setup ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw logging low
 
-
+## 5. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
-sudo rm -f /etc/fail2ban/jail.local
-sudo rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
+rm -f /etc/fail2ban/jail.local
+rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
 
-
-sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
 [ufw]
 enabled = true
 filter = ufw-aggressive
@@ -100,13 +92,15 @@ maxretry = 5
 bantime = 7d
 EOF
 
-sudo tee /etc/fail2ban/filter.d/ufw-aggressive.conf > /dev/null <<'EOF'
+tee /etc/fail2ban/filter.d/ufw-aggressive.conf > /dev/null <<'EOF'
 [Definition]
 failregex = \[UFW BLOCK\].*SRC=<HOST> DST
 ignoreregex =
 EOF
 
-sudo ufw --force enable
+## 6. Enable UFW / Restart Fail2ban
+ufw --force enable
+systemctl enable fail2ban
+systemctl restart fail2ban
 
-sudo systemctl enable fail2ban
-sudo systemctl restart fail2ban
+echo "Security rules setup completed successfully."
