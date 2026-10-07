@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Color definitions for better UI
-GREEN='\e[0;32m'
-YELLOW='\e[1;33m'
-RED='\e[0;31m'
-NC='\e[0m' # No Color
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
 echo -e "${GREEN}"
 echo "        Security access only for" 
