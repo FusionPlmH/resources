@@ -91,14 +91,23 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 5. Check Proxmox Virtual Environment & Smart Interface CIDR Extraction
+## 5. Check Proxmox Virtual Environment & Fully Adaptive CIDR Extraction
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
-    echo "Proxmox Virtual Environment is active, parsing vmbr0 network configuration..."
+    echo "Proxmox Virtual Environment is active, parsing network configuration for adaptive subnets..."
     
     target_dev=""
-    cidr=""
+    declare -a candidate_cidrs=()
     
-    # 5.1 Parse /etc/network/interfaces for vmbr0 configuration
+    # 5.1 Parse vmbr0 configured subnets automatically
+    if ip link show vmbr0 >/dev/null 2>&1; then
+        while read -r vmbr_cidr; do
+            if [[ -n "$vmbr_cidr" ]]; then
+                candidate_cidrs+=("$vmbr_cidr")
+            fi
+        done < <(ip -4 -o addr show dev vmbr0 2>/dev/null | awk '{print $4}')
+    fi
+    
+    # 5.2 Parse /etc/network/interfaces for physical device or iptables NAT routing device
     if [ -f /etc/network/interfaces ]; then
         bridge_val=$(awk '/^iface vmbr0/,/^iface|^auto|^mapping/ {if ($1=="bridge-ports") print $2}' /etc/network/interfaces | head -n1)
         
@@ -106,9 +115,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
             target_dev="$bridge_val"
             echo "Found bridge-ports device: $target_dev"
         else
-            echo "bridge-ports is set to 'none', checking iptables rules in vmbr0..."
             iptables_line=$(awk '/^iface vmbr0/,/^iface|^auto|^mapping/ {if ($1=="post-up" && $0~/iptables/) print $0}' /etc/network/interfaces | head -n1)
-            
             if [ -n "$iptables_line" ]; then
                 target_dev=$(echo "$iptables_line" | sed -E 's/.*-o[[:space:]]+([a-zA-Z0-9_-]+).*/\1/')
                 echo "Extracted physical interface from iptables rule: $target_dev"
@@ -116,23 +123,45 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
         fi
     fi
     
-    # 5.2 Retrieve CIDR using the extracted physical device
+    # 5.3 Obtain subnet from the physical interface if available
     if [ -n "$target_dev" ] && ip link show "$target_dev" >/dev/null 2>&1; then
-        cidr=$(ip -4 route show dev "$target_dev" 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+        while read -r phys_cidr; do
+            if [[ -n "$phys_cidr" ]]; then
+                candidate_cidrs+=("$phys_cidr")
+            fi
+        done < <(ip -4 route show dev "$target_dev" 2>/dev/null | awk '/proto kernel/ {print $1}')
     fi
     
-    # 5.3 Fallback to vmbr0 routing if needed
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
+    # 5.4 Fallback to default route interface if nothing found
+    if [ ${#candidate_cidrs[@]} -eq 0 ]; then
+        default_dev=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1 || true)
+        if [ -n "$default_dev" ]; then
+            while read -r def_cidr; do
+                if [[ -n "$def_cidr" ]]; then
+                    candidate_cidrs+=("$def_cidr")
+                fi
+            done < <(ip -4 route show dev "$default_dev" 2>/dev/null | awk '/proto kernel/ {print $1}')
+        fi
     fi
     
-    # 5.4 Validate CIDR and apply UFW rule
-    if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        echo -e "Allowing PVE web management on vmbr0 from derived CIDR: ${GREEN}$cidr${NC}..."
-        ufw allow in on vmbr0 from "$cidr" to any port 8006 >/dev/null 2>&1
-        echo -e "${GREEN}✓ PVE 8006 rule added successfully.${NC}"
+    # 5.5 Deduplicate and apply UFW rules adaptively for private subnets only
+    applied_count=0
+    for raw_cidr in "${candidate_cidrs[@]}"; do
+        # Validate CIDR format
+        if [[ "$raw_cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            # Verify if it is a private IP range (RFC 1918)
+            if [[ "$raw_cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
+                echo -e "Allowing PVE web management on vmbr0 from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
+                ufw allow in on vmbr0 from "$raw_cidr" to any port 8006 >/dev/null 2>&1
+                ((applied_count++))
+            fi
+        fi
+    done
+    
+    if [ "$applied_count" -gt 0 ]; then
+        echo -e "${GREEN}✓ PVE 8006 adaptive rules added successfully ($applied_count subnets allowed).${NC}"
     else
-        echo -e "${YELLOW}Valid CIDR could not be determined automatically, skipping Proxmox rule...${NC}"
+        echo -e "${YELLOW}Warning: No valid private subnets dynamically detected for 8006 exposure.${NC}"
     fi
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
