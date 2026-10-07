@@ -95,7 +95,7 @@ fi
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, scanning active private subnets..."
     
-    # 自動抓取對外實體網卡
+    # Automatically capture the external physical network interface card
     target_interface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
     if [ -z "$target_interface" ]; then
         target_interface="vmbr0"
@@ -103,11 +103,10 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo -n "Using target network interface for 8006 rule: "
     echo -e "${GREEN}${target_interface}${NC}"
     
-    # 改進：直接抓取該對外網卡上綁定的區域 IP 網段（例如 192.168.31.x/24）
+    # Directly grab the local subnet assigned to the external interface (e.g. 192.168.31.x/24)
     applied_count=0
     while read -r local_ip; do
         if [[ -n "$local_ip" ]]; then
-            # 計算出該 IP 的 /24 網段
             subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
             if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
                 echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
@@ -117,7 +116,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
         fi
     done < <(ip -4 addr show dev "$target_interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
     
-    # 同時保險起見，把 10.10.10.0/24 內部虛擬網段也一併加入
+    # Also explicitly ensure internal bridge access is allowed
     echo -e "Allowing PVE web management on internal bridge: ${GREEN}10.10.10.0/24${NC}..."
     ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 >/dev/null 2>&1 || true
     ((applied_count++))
