@@ -28,7 +28,14 @@ check_and_install() {
 check_and_install ufw
 check_and_install fail2ban
 
-## 2. Safely check and clean legacy port 443 rules
+## 2. Initialize and Ensure UFW is Active First
+echo "Initializing UFW default policies and enabling firewall..."
+ufw default deny incoming
+ufw default allow outgoing
+ufw logging low
+ufw --force enable >/dev/null 2>&1
+
+## 3. Safely check and clean legacy port 443 rules
 echo "Checking existing UFW rules for legacy entries..."
 
 if ufw status 2>/dev/null | grep -q "443"; then
@@ -43,7 +50,7 @@ if ufw status 2>/dev/null | grep -q "443"; then
     done
 fi
 
-## 3. Check Cloudflare WARP / Mesh
+## 4. Check Cloudflare WARP / Mesh
 WARP_IF=""
 if ip link show CloudflareWARP >/dev/null 2>&1; then
     WARP_IF="CloudflareWARP"
@@ -58,7 +65,7 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 4. Check Proxmox Virtual Environment
+## 5. Check Proxmox Virtual Environment
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, adding rules..."
     cidr=$(ip -4 route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
@@ -73,18 +80,13 @@ else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
 
-## 5. Check Tailscale interface
+## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
     echo "Tailscale is installed, adding rules..."
     ufw allow on tailscale0
 else
     echo "Tailscale not installed, skipping..."
 fi
-
-## 6. Setup UFW defaults and logging
-ufw default deny incoming
-ufw default allow outgoing
-ufw logging low
 
 ## 7. Setting Up Fail2ban
 echo "Setting Up Fail2ban..."
@@ -115,8 +117,8 @@ failregex = \[UFW BLOCK\].*SRC=<HOST> DST
 ignoreregex =
 EOF
 
-## 8. Enable UFW / Restart Fail2ban
-ufw --force enable
+## 8. Reload UFW & Restart Fail2ban
+ufw reload >/dev/null 2>&1
 systemctl enable fail2ban
 systemctl restart fail2ban
 
