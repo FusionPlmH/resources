@@ -110,7 +110,7 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
             subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
             if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
                 echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
-                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
+                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 || true
                 ((applied_count++))
             fi
         fi
