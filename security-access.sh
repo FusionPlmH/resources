@@ -41,6 +41,22 @@ else
     echo "Cloudflared not installed, skipping..."
 fi
 
+# 2. 检查并配置 Cloudflare WARP / Mesh
+# 说明：Cloudflare WARP 在 Linux 上创建的接口一般为 CloudflareWARP 或 warp0
+WARP_IF=""
+if ip link show CloudflareWARP >/dev/null 2>&1; then
+    WARP_IF="CloudflareWARP"
+elif ip link show warp0 >/dev/null 2>&1; then
+    WARP_IF="warp0"
+fi
+
+if [ -n "$WARP_IF" ]; then
+    echo "Cloudflare WARP/Mesh ($WARP_IF) is installed, adding rules..."
+    ufw allow in out on "$WARP_IF"
+else
+    echo "Cloudflare WARP/Mesh not installed, skipping..."
+fi
+
 ## Check Proxmox Virtual Environment
 if nc -zv localhost 8006 2>&1 | grep -q 'open'; then
     echo "Proxmox Virtual Environment is installed, adding rules..."
