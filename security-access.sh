@@ -95,32 +95,33 @@ fi
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, scanning active private subnets..."
     
-    # Automatically capture the name of the external physical network interface card (such as wlp1s0f0 or the default routing interface).
+    # 自動抓取對外實體網卡
     target_interface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
     if [ -z "$target_interface" ]; then
-        target_interface="vmbr0" # 
+        target_interface="vmbr0"
     fi
     echo -n "Using target network interface for 8006 rule: "
     echo -e "${GREEN}${target_interface}${NC}"
     
-    declare -a candidate_cidrs=()
-    while read -r detected_cidr; do
-        if [[ -n "$detected_cidr" ]]; then
-            candidate_cidrs+=("$detected_cidr")
-        fi
-    done < <(ip -4 route show scope global 2>/dev/null | awk '{print $1}')
-    
+    # 改進：直接抓取該對外網卡上綁定的區域 IP 網段（例如 192.168.31.x/24）
     applied_count=0
-    for raw_cidr in "${candidate_cidrs[@]}"; do
-        if [[ "$raw_cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-            if [[ "$raw_cidr" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-                echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from adaptive subnet: ${GREEN}$raw_cidr${NC}..."
-                ufw allow in on "$target_interface" from "$raw_cidr" to any port 8006 >/dev/null 2>&1 || true
+    while read -r local_ip; do
+        if [[ -n "$local_ip" ]]; then
+            # 計算出該 IP 的 /24 網段
+            subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
+            if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
+                echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
+                ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 >/dev/null 2>&1 || true
                 ((applied_count++))
             fi
         fi
-    done
+    done < <(ip -4 addr show dev "$target_interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
     
+    # 同時保險起見，把 10.10.10.0/24 內部虛擬網段也一併加入
+    echo -e "Allowing PVE web management on internal bridge: ${GREEN}10.10.10.0/24${NC}..."
+    ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 >/dev/null 2>&1 || true
+    ((applied_count++))
+
     if [ "$applied_count" -gt 0 ]; then
         echo -e "${GREEN}✓ PVE 8006 adaptive rules added successfully ($applied_count subnets allowed).${NC}"
     else
@@ -129,7 +130,6 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
 else
     echo "Proxmox Virtual Environment not active or not installed, skipping..."
 fi
-
 
 ## 6. Check Tailscale interface
 if ip link show tailscale0 >/dev/null 2>&1; then
