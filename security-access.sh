@@ -103,20 +103,21 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo -e "${GREEN}${target_interface}${NC}"
     
     applied_count=0
-    while read -r local_ip; do
+    ips=$(ip -4 addr show dev "$target_interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || true)
+    for local_ip in $ips; do
         if [[ -n "$local_ip" ]]; then
             subnet_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
             if [[ "$subnet_prefix" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
                 echo -e "Allowing PVE web management on ${GREEN}$target_interface${NC} from detected subnet: ${GREEN}$subnet_prefix${NC}..."
                 ufw allow in on "$target_interface" from "$subnet_prefix" to any port 8006 || true
-                ((applied_count++))
+                applied_count=$((applied_count + 1))
             fi
         fi
-    done < <(ip -4 addr show dev "$target_interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+    done
     
     echo -e "Allowing PVE web management on internal bridge: ${GREEN}10.10.10.0/24${NC}..."
     ufw allow in on vmbr0 from "10.10.10.0/24" to any port 8006 || true
-    ((applied_count++))
+    applied_count=$((applied_count + 1))
 
     if [ "$applied_count" -gt 0 ]; then
         echo -e "${GREEN}✓ PVE 8006 adaptive rules added successfully ($applied_count subnets allowed).${NC}"
