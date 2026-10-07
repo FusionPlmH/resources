@@ -190,6 +190,23 @@ ufw reload >/dev/null 2>&1
 systemctl enable fail2ban >/dev/null 2>&1
 systemctl restart fail2ban >/dev/null 2>&1
 
+## Enable autorun on every network reboot
+INTERFACES_FILE="/etc/network/interfaces"
+AUTO_UPDATE_LINE="        post-up   wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh"
+
+if [ -f "$INTERFACES_FILE" ]; then
+    if ! grep -q "security-access.sh" "$INTERFACES_FILE"; then
+        echo "Adding auto-update post-up hook to /etc/network/interfaces..."
+        
+        sed -i '/post-down iptables.*MASQUERADE/a \
+        post-up   wget -qO /usr/local/bin/security-access.sh https://raw.githubusercontent.com/FusionPlmH/resources/main/security-access.sh && chmod +x /usr/local/bin/security-access.sh && /usr/local/bin/security-access.sh' "$INTERFACES_FILE"
+        
+        echo -e "${GREEN}✓ Auto-update post-up hook successfully added!${NC}"
+    else
+        echo "Auto-update post-up hook already exists in $INTERFACES_FILE, skipping insertion."
+    fi
+fi
+
 echo ""
 echo "=================================================="
 echo -e "${GREEN}Current active UFW rules:${NC}"
