@@ -35,15 +35,30 @@ ufw default allow outgoing
 ufw logging low
 ufw --force enable >/dev/null 2>&1
 
-## 3. Safely check and clean legacy port 443 rules (100% Guaranteed Cleanup)
+## 3. Safely check and clean legacy port rules (443 & unqualified 8006)
 echo "Checking existing UFW rules for legacy entries..."
 
+# 3.1 Cleanup legacy 443 rules
 if ufw status 2>/dev/null | grep -w -q "443"; then
     echo "Found legacy 443 port rules, cleaning up..."
     while ufw status numbered 2>/dev/null | grep -w "443" | grep -q "\["; do
         num=$(ufw status numbered 2>/dev/null | grep -w "443" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
         if [ -n "$num" ]; then
             echo "Deleting 443 rule #$num..."
+            echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
+        else
+            break
+        fi
+    done
+fi
+
+# 3.2 Cleanup unqualified 8006 rules (rules not tied to vmbr0)
+if ufw status 2>/dev/null | grep -v "on vmbr0" | grep -w -q "8006"; then
+    echo "Found unqualified 8006 legacy rules (without vmbr0 interface), cleaning up..."
+    while ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -w "8006" | grep -q "\["; do
+        num=$(ufw status numbered 2>/dev/null | grep -v "on vmbr0" | grep -w "8006" | head -n1 | sed -E 's/.*\[ *([0-9]+)\].*/\1/')
+        if [ -n "$num" ]; then
+            echo "Deleting unqualified 8006 rule #$num..."
             echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
         else
             break
