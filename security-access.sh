@@ -58,15 +58,15 @@ else
     echo "Cloudflare WARP/Mesh not installed, skipping..."
 fi
 
-## 4. Check Proxmox Virtual Environment
+## 4. Check Proxmox Virtual Environment (Option A: Restricted to vmbr0 interface)
 if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     echo "Proxmox Virtual Environment is active, adding rules..."
     cidr=$(ip route show dev vmbr0 2>/dev/null | awk '/proto kernel/ {print $1}' | head -n1 || true)
     
-    # Strictly validate CIDR format before applying UFW rule
+    # Validate CIDR format and apply Interface-bound UFW rule
     if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        echo "Allowing PVE web management from validated CIDR: $cidr..."
-        ufw allow from "$cidr" to any port 8006
+        echo "Allowing PVE web management on vmbr0 interface from CIDR: $cidr..."
+        ufw allow in on vmbr0 from "$cidr" to any port 8006
     else
         echo "Valid CIDR on vmbr0 not detected, skipping Proxmox rule..."
     fi
