@@ -100,7 +100,8 @@ if (echo > /dev/tcp/127.0.0.1/8006) >/dev/null 2>&1; then
     if [ -z "$target_interface" ]; then
         target_interface="vmbr0" # 
     fi
-    echo "Using target network interface for 8006 rule: ${GREEN}$target_interface${NC}"
+    echo -n "Using target network interface for 8006 rule: "
+    echo -e "${GREEN}${target_interface}${NC}"
     
     declare -a candidate_cidrs=()
     while read -r detected_cidr; do
