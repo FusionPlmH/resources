@@ -56,10 +56,12 @@
 #    clears all active bans, so a reboot never inherits state.
 #
 # 8. Self-update and boot hook
-#    /etc/network/if-up.d/security-access runs this file with --self-update on
-#    every interface up (boot, ifup, ifreload). The new version is downloaded,
-#    syntax checked with "bash -n" and moved into place; when the download
-#    fails the existing file is kept and used. No backups are kept.
+#    /etc/network/if-up.d/security-access runs this file with --self-update
+#    when the management bridge or the current uplink comes up. The new version
+#    is downloaded, syntax checked with "bash -n" and moved into place; when
+#    the download fails the existing file is kept and used.
+#    Exactly one copy of the script is kept: $SELF_DEST. Any leftover
+#    ".bak" / ".old" / ".new" copies are deleted on every run.
 #===============================================================================
 set -euo pipefail
 
@@ -217,6 +219,11 @@ iface_exists() {
 # Interface names as reported by ip, without the "@parent" suffix.
 list_ifaces() {
     ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | sort -u
+}
+
+# Interfaces that currently own a global IPv4 address, "@parent" removed.
+list_v4_ifaces() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sed 's/@.*//' | sort -u
 }
 
 # Real prefix length from the routing table; never assume /24.
@@ -400,7 +407,7 @@ while read -r ifc; do
         LAN_IFACES+=("$ifc")
         info "  LAN interface: $ifc"
     fi
-done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sort -u)
+done < <(list_v4_ifaces)
 
 # 3.2 Tailscale and Cloudflare tunnel / WARP interfaces (matches any name).
 while read -r ifc; do
@@ -538,8 +545,13 @@ if iface_exists tailscale0; then
                 echo "net.ipv6.conf.all.forwarding = 1"
             fi
         } > /etc/sysctl.d/99-tailscale-forward.conf
-        sysctl -q --system >/dev/null 2>&1 || true
+
+        # Apply only the keys we own; "sysctl --system" would re-apply every
+        # file in /etc/sysctl.d and could overwrite unrelated runtime values.
         sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+        if [ "$TS_IPV6_FORWARDING" = "1" ]; then
+            sysctl -qw net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+        fi
 
         # in  : exit-node traffic and tailnet -> LAN (subnet router)
         # out : return path and LAN -> tailnet
@@ -643,22 +655,34 @@ EOF
     fi
 
     # 8.5 Purge every active ban: a reboot must never inherit a stale ban.
-    #     The ufw action also removes the matching "deny" rule.
-    if fail2ban-client ping >/dev/null 2>&1; then
-        fail2ban-client unban --all >/dev/null 2>&1 || true
-        info "  all fail2ban bans cleared."
-    fi
+    #     The socket may not be ready immediately after the restart, so retry.
+    for attempt in 1 2 3 4 5; do
+        if fail2ban-client ping >/dev/null 2>&1; then
+            fail2ban-client unban --all >/dev/null 2>&1 || true
+            info "  all fail2ban bans cleared."
+            break
+        fi
+        sleep 1
+    done
 fi
 
 ## 9. Persist on boot
-# $SELF_DEST is only a cache: /etc/network/if-up.d/security-access calls it
-# with --self-update on every ifup, so each boot or network restart overwrites
-# it with the newest upstream version first.
+# Exactly one copy of this script is kept. Remove staging and any historical
+# leftovers so no stale version can be executed later.
+rm -f "${SELF_DEST}.new" "${SELF_DEST}.bak" "${SELF_DEST}.old" 2>/dev/null || true
+
+# Install the running file as the cache, but never downgrade a newer cache.
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || true)"
 if [ "$NO_SELF_INSTALL" != "1" ] \
    && [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ] && [ "$SELF_PATH" != "$SELF_DEST" ]; then
-    install -m 0755 "$SELF_PATH" "$SELF_DEST"
-    info "Installed this script to $SELF_DEST"
+    if [ -f "$SELF_DEST" ] && cmp -s "$SELF_PATH" "$SELF_DEST"; then
+        info "Cache $SELF_DEST is already identical."
+    elif [ -f "$SELF_DEST" ] && [ "$SELF_DEST" -nt "$SELF_PATH" ]; then
+        warn "Cache $SELF_DEST is newer than $SELF_PATH; not overwriting."
+    else
+        install -m 0755 "$SELF_PATH" "$SELF_DEST"
+        info "Installed this script to $SELF_DEST"
+    fi
 fi
 
 # Delete the legacy post-up hook: PVE rewrites /etc/network/interfaces from its
@@ -669,13 +693,26 @@ if grep -q '^[[:space:]]*post-up.*security-access' /etc/network/interfaces 2>/de
 fi
 
 # if-up.d runs on every interface up and is not managed by the PVE network
-# stack. It always exits 0 so a failure can never block network setup.
+# stack. Only the management bridge and the current uplink are worth a run;
+# everything else would just repeat an idempotent execution.
 install -d -m 0755 /etc/network/if-up.d
 cat > /etc/network/if-up.d/security-access <<'EOF'
 #!/bin/sh
-[ "$IFACE" = "vmbr0" ] || exit 0
 [ "$MODE" = "start" ] || exit 0
-/usr/local/bin/security-access.sh --self-update >/var/log/security-access.log 2>&1 || true
+
+run=0
+case "$IFACE" in
+    vmbr0) run=1 ;;
+    *)
+        wan=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+        if [ -n "$wan" ] && [ "$IFACE" = "$wan" ]; then
+            run=1
+        fi
+        ;;
+esac
+[ "$run" -eq 1 ] || exit 0
+
+/usr/local/bin/security-access.sh --self-update > /var/log/security-access.log 2>&1 || true
 exit 0
 EOF
 chmod 0755 /etc/network/if-up.d/security-access
