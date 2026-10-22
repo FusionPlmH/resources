@@ -5,15 +5,17 @@
 # DESIGN
 # ------
 # Goal: expose this host on exactly two TCP ports (8006 and SSH) and only to
-#       three trusted paths: the local LAN, cloudflared, and tailscale0.
+#       three trusted paths: the local LAN, cloudflared and tailscale0.
 #
 # 1. Policy model
 #    - inbound : default DROP, explicit "interface + port" allow rules only.
-#    - outbound: default ACCEPT. cloudflared needs 7844/tcp+udp to the edge,
-#      tailscale needs 41641/udp and 443/tcp (DERP), plus DNS. Denying egress
-#      would break the very paths this script is supposed to allow.
-#    - forward : UFW defaults it to DROP; re-opened only when NAT is detected
-#      so that guests keep their internet access.
+#      Explicit OUT rules are not created on purpose: the default outbound
+#      policy is ACCEPT, and cloudflared (7844/tcp+udp), tailscale (41641/udp,
+#      443/tcp for DERP) and DNS all depend on unrestricted egress. Adding
+#      per-port OUT rules would only duplicate what the policy already allows.
+#    - forward : UFW defaults it to DROP. It is re-opened only for
+#      (a) detected NAT towards the uplink and (b) tailscale0 when tailscale
+#      is present. Forward rules never widen the inbound policy of the host.
 #
 # 2. Interface selection (why vmbr0 and not end0)
 #    Traffic addressed to the host's bridge IP enters the input chain with
@@ -28,25 +30,32 @@
 #
 # 4. Supported environments
 #    a) public address on vmbr0 : no management rule is added for that
-#       interface (tunnels only), the host stays reachable via tailscale0,
+#       interface (tunnels only); the host stays reachable via tailscale0,
 #       CloudflareWARP or loopback (cloudflared).
 #    b) private address on vmbr0: the link subnet is allowed on 8006 and SSH.
 #    c) DHCP uplink bridged/NATed to vmbr0: the uplink holds a private address
 #       and is therefore trusted like any other LAN; stale source rules from a
-#       previous DHCP network are pruned, and NAT forwarding is preserved.
+#       previous DHCP network are pruned and NAT forwarding is preserved.
 #
-# 5. Order of operations
+# 5. Tailscale
+#    As soon as tailscale0 exists the host is treated as exit node and subnet
+#    router: IP forwarding is persisted in /etc/sysctl.d and FORWARD is opened
+#    in/out of tailscale0. Direct peer links additionally need inbound
+#    UDP/41641 on the uplink. Disable with TS_SUBNET_ROUTING=0 or
+#    TS_DIRECT_UDP=0.
+#
+# 6. Order of operations
 #    allow rules -> legacy cleanup -> default policies -> ufw enable.
 #    Enabling UFW before the allow rules exist can lock the operator out.
 #
-# 6. Fail2ban safety
+# 7. Fail2ban safety
 #    A fail2ban ban is inserted at the top of the ufw chains and therefore
 #    overrides allow rules. RFC1918, CGNAT (100.64.0.0/10) and the Tailscale
-#    IPv6 prefix are listed in ignoreip so internal clients are never banned.
-#    Every run also rewrites the jail definitions, deletes legacy filter/jail
-#    artifacts and clears all active bans, so a reboot never inherits state.
+#    IPv6 prefix are in ignoreip so internal clients are never banned. Every
+#    run also rewrites the jail definitions, deletes legacy artifacts and
+#    clears all active bans, so a reboot never inherits state.
 #
-# 7. Self-update and boot hook
+# 8. Self-update and boot hook
 #    /etc/network/if-up.d/security-access runs this file with --self-update on
 #    every interface up (boot, ifup, ifreload). The new version is downloaded,
 #    syntax checked with "bash -n" and moved into place; when the download
@@ -65,12 +74,18 @@ warn() { echo -e "${YELLOW}$*${NC}"; }
 error() { echo -e "${RED}$*${NC}"; }
 
 #------------------------------------------------------------------------------
-# Self-update configuration and command line
+# Configuration and command line
 #------------------------------------------------------------------------------
 SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/FusionPlmH/resources/refs/heads/main/security-access.sh}"
 SELF_DEST="/usr/local/bin/security-access.sh"
 SELF_UPDATE_REQUESTED=0
 NO_SELF_INSTALL=0
+
+PVE_PORT="${PVE_PORT:-8006}"
+TS_SUBNET_ROUTING="${TS_SUBNET_ROUTING:-1}"
+TS_DIRECT_UDP="${TS_DIRECT_UDP:-1}"
+TS_IPV6_FORWARDING="${TS_IPV6_FORWARDING:-0}"
+FORCE="${FORCE:-0}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -80,17 +95,21 @@ for arg in "$@"; do
             echo "Usage: $0 [--self-update] [--no-self-install]"
             echo "  --self-update      download, verify and replace $SELF_DEST, then re-exec"
             echo "  --no-self-install  do not copy the running file to $SELF_DEST"
-            echo "Download URL can be overridden with SELF_URL=<url>."
-            echo "Set FORCE=1 to enable UFW even without any management path."
-            echo "Set FAIL2BAN_PURGE_DB=1 to also delete the fail2ban ban database."
+            echo "Environment:"
+            echo "  SELF_URL=<url>            override the download source"
+            echo "  FORCE=1                   enable UFW even without a management path"
+            echo "  TS_SUBNET_ROUTING=0       skip exit-node / subnet-router forwarding"
+            echo "  TS_DIRECT_UDP=0           skip inbound UDP/41641 for direct peers"
+            echo "  TS_IPV6_FORWARDING=1      also enable IPv6 forwarding"
+            echo "  FAIL2BAN_PURGE_DB=1       delete the fail2ban ban database"
             exit 0 ;;
         *) warn "Unknown option: $arg" ;;
     esac
 done
 
 # Download, validate and replace the local copy in place.
-# A short lived "<dest>.new" staging file is used so the running bash does not
-# read a truncated file; it is removed right after the successful mv.
+# A short lived "<dest>.new" staging file avoids truncating a file that bash is
+# still reading; it is removed right after the successful mv.
 self_update() {
     local tmp newf rc=1
     tmp="$(mktemp /tmp/security-access.XXXXXX.sh)" || return 1
@@ -108,7 +127,6 @@ self_update() {
         return 1
     fi
 
-    # Never replace a working copy with something bash cannot parse.
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         warn "Self-update: syntax check failed, keeping the current file."
@@ -131,11 +149,6 @@ self_update() {
     warn "Self-update: write failed, keeping the current file."
     return 1
 }
-
-PVE_PORT="${PVE_PORT:-8006}"
-TS_SUBNET_ROUTING="${TS_SUBNET_ROUTING:-0}"
-TS_DIRECT_UDP="${TS_DIRECT_UDP:-0}"
-FORCE="${FORCE:-0}"
 
 echo -e "${GREEN}"
 echo "        Security access only for"
@@ -201,6 +214,11 @@ iface_exists() {
     ip link show "$1" >/dev/null 2>&1
 }
 
+# Interface names as reported by ip, without the "@parent" suffix.
+list_ifaces() {
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | sort -u
+}
+
 # Real prefix length from the routing table; never assume /24.
 iface_v4_nets() {
     ip -4 route show dev "$1" scope link 2>/dev/null \
@@ -224,7 +242,7 @@ detect_ssh_ports() {
             | sed -E 's/.*:([0-9]+)$/\1/' \
             | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)
     fi
-    echo "${ports:-22 }"
+    echo "${ports:-22}"
 }
 
 # True when this host performs IPv4 NAT for its guests. The live ruleset is
@@ -251,14 +269,41 @@ has_nat() {
 }
 
 # Allowed TCP ports: Proxmox web UI plus every real SSH port.
+SSH_PORTS="$(detect_ssh_ports)"
 ALLOW_PORTS=("$PVE_PORT")
-for port in $(detect_ssh_ports); do
+for port in $SSH_PORTS; do
     if [ "$port" != "$PVE_PORT" ]; then
         ALLOW_PORTS+=("$port")
     fi
 done
 
-# Allow the management ports in/out of one interface.
+is_allowed_port() {
+    local candidate="$1" port
+    for port in "${ALLOW_PORTS[@]}"; do
+        if [ "$port" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+MANAGED_IFACES=()
+LAN_IFACES=()
+OVERLAY_FOUND=0
+
+# Register "interface|source" once. Returns 0 only when it was actually added.
+add_managed() {
+    local entry="$1|${2:-}" existing
+    for existing in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
+        if [ "$existing" = "$entry" ]; then
+            return 1
+        fi
+    done
+    MANAGED_IFACES+=("$entry")
+    return 0
+}
+
+# Allow the management ports inbound on one interface.
 # $1 = interface, $2 = optional source CIDR (empty means any source).
 allow_mgmt() {
     local ifc="$1" src="${2:-}" port
@@ -273,8 +318,6 @@ allow_mgmt() {
             ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 \
                 || warn "  failed: allow in on $ifc port $port"
         fi
-        # Documentation value while the default outbound policy is ACCEPT.
-        ufw allow out on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
     done
 }
 
@@ -292,37 +335,17 @@ delete_rules_matching() {
     done
 }
 
-MANAGED_IFACES=()
-LAN_IFACES=()
-OVERLAY_FOUND=0
-
-add_managed() {
-    local entry="$1|${2:-}" existing
-    for existing in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
-        if [ "$existing" = "$entry" ]; then
-            return 0
-        fi
-    done
-    MANAGED_IFACES+=("$entry")
-}
-
-# Remove interface scoped source rules whose subnet no longer matches the
+# Remove interface-scoped source rules whose subnet no longer matches the
 # interface (DHCP moved to another network). Only management ports are
-# considered, only interfaces that still exist and hold an address, so a link
-# that is temporarily down keeps its rules.
+# considered and only interfaces that still exist and hold an address, so a
+# link that is temporarily down keeps its rules.
 prune_stale_source_rules() {
-    local num port rule_ifc src allowed nets pinned
+    local num port rule_ifc src nets
     local -a stale=()
 
     while IFS='|' read -r num port rule_ifc src; do
         if [ -z "$num" ]; then continue; fi
-
-        allowed=0
-        for pinned in "${ALLOW_PORTS[@]}"; do
-            if [ "$port" = "$pinned" ]; then allowed=1; fi
-        done
-        if [ "$allowed" -ne 1 ]; then continue; fi
-
+        if ! is_allowed_port "$port"; then continue; fi
         if ! iface_exists "$rule_ifc"; then continue; fi
         if [ -z "$(iface_v4_addrs "$rule_ifc")" ]; then continue; fi
 
@@ -356,7 +379,7 @@ while read -r ifc; do
     while read -r net; do
         if [ -z "$net" ]; then continue; fi
         if is_private_v4 "${net%%/*}"; then
-            add_managed "$ifc" "$net"
+            add_managed "$ifc" "$net" || true
             matched=1
         fi
     done <<< "$(iface_v4_nets "$ifc")"
@@ -367,7 +390,7 @@ while read -r ifc; do
         while read -r addr; do
             if [ -z "$addr" ]; then continue; fi
             if is_private_v4 "${addr%%/*}"; then
-                add_managed "$ifc" ""
+                add_managed "$ifc" "" || true
                 matched=1
             fi
         done <<< "$(iface_v4_addrs "$ifc")"
@@ -379,37 +402,34 @@ while read -r ifc; do
     fi
 done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sort -u)
 
-# 3.2 Tailscale and Cloudflare tunnel / WARP interfaces.
-for ifc in tailscale0 CloudflareWARP warp0 cloudflared; do
-    if iface_exists "$ifc"; then
-        add_managed "$ifc" ""
-        OVERLAY_FOUND=1
-        info "  Overlay interface: $ifc"
-    fi
-done
+# 3.2 Tailscale and Cloudflare tunnel / WARP interfaces (matches any name).
 while read -r ifc; do
     if [ -z "$ifc" ]; then continue; fi
     case "$ifc" in
-        warp*|cloudflared*|CloudflareWARP*)
-            add_managed "$ifc" ""
-            OVERLAY_FOUND=1
-            info "  Overlay interface: $ifc"
+        tailscale*|warp*|CloudflareWARP*|cloudflared*)
+            if add_managed "$ifc" ""; then
+                OVERLAY_FOUND=1
+                info "  Overlay interface: $ifc"
+            fi
             ;;
     esac
-done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ' | sort -u)
+done < <(list_ifaces)
 
 # 3.3 cloudflared origin path: loopback, plus Docker bridges when the
 #     connector runs as a container.
-add_managed lo ""
+if add_managed lo ""; then
+    info "  Loopback origin: lo"
+fi
 while read -r ifc; do
     if [ -z "$ifc" ]; then continue; fi
     case "$ifc" in
         docker0|br-*)
-            add_managed "$ifc" ""
-            info "  Container origin interface: $ifc"
+            if add_managed "$ifc" ""; then
+                info "  Container origin interface: $ifc"
+            fi
             ;;
     esac
-done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ' | sort -u)
+done < <(list_ifaces)
 
 # 3.4 Classify the uplink so the log shows which environment was detected.
 WAN_IF="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
@@ -422,11 +442,6 @@ if [ -n "$WAN_IF" ]; then
     else
         info "  Uplink $WAN_IF is public ($WAN_ADDR): management ports stay closed."
     fi
-fi
-
-if [ "${#MANAGED_IFACES[@]}" -eq 0 ]; then
-    error "No manageable interface found, aborting to avoid a lockout."
-    exit 1
 fi
 
 # Refuse to enable a firewall that would leave no management path at all.
@@ -468,8 +483,6 @@ for member in $BRIDGE_MEMBERS; do
     done
 done
 
-# Legacy "allow everything" rules on the overlay interfaces, e.g. the old
-# "ufw allow in on CloudflareWARP to any" / "ufw allow out on tailscale0 to any".
 for ovl in tailscale0 CloudflareWARP warp0 cloudflared; do
     delete_rules_matching "^\\[ *[0-9]+\\] +Anywhere( \\(v6\\))? +on ${ovl} +ALLOW (IN|OUT) +Anywhere( \\(v6\\))? *\$"
 done
@@ -480,14 +493,14 @@ prune_stale_source_rules
 ## 6. Default policies and enable UFW
 echo "Initializing UFW policies..."
 systemctl enable ufw >/dev/null 2>&1 || true
-systemctl start ufw >/dev/null 2>&1 || true
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 ufw logging low >/dev/null
 ufw --force enable >/dev/null
 info "UFW enabled; inbound limited to ${ALLOW_PORTS[*]}."
 
-## 7. Preserve forwarding for NAT setups
+## 7. Forwarding: NAT and Tailscale
+# 7.1 Guest NAT: keep vmbr0-style internal bridges able to reach the uplink.
 if has_nat; then
     if [ -z "$WAN_IF" ]; then
         warn "NAT detected but no default route found; forwarding rule not added."
@@ -513,18 +526,34 @@ else
     info "No NAT detected; forwarding stays at 'deny (routed)'."
 fi
 
-# Optional: tailscale subnet router / exit node.
-if [ "$TS_SUBNET_ROUTING" = "1" ] && iface_exists tailscale0; then
-    ufw route allow in on tailscale0 >/dev/null 2>&1 || true
-    ufw route allow out on tailscale0 >/dev/null 2>&1 || true
-    sysctl -qw net.ipv4.ip_forward=1 || true
-    info "Tailscale forwarding enabled (TS_SUBNET_ROUTING=1)."
-fi
+# 7.2 Tailscale: exit node + subnet router + direct peer links, as soon as
+#     tailscale0 exists. These are FORWARD rules; the inbound policy of the
+#     host itself stays limited to the management ports.
+if iface_exists tailscale0; then
+    if [ "$TS_SUBNET_ROUTING" = "1" ]; then
+        info "Configuring tailscale forwarding (exit node / subnet router)..."
+        {
+            echo "net.ipv4.ip_forward = 1"
+            if [ "$TS_IPV6_FORWARDING" = "1" ]; then
+                echo "net.ipv6.conf.all.forwarding = 1"
+            fi
+        } > /etc/sysctl.d/99-tailscale-forward.conf
+        sysctl -q --system >/dev/null 2>&1 || true
+        sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
 
-# Optional: direct tailscale connections (otherwise traffic stays on DERP).
-if [ "$TS_DIRECT_UDP" = "1" ] && [ -n "$WAN_IF" ] && iface_exists tailscale0; then
-    if ufw allow in on "$WAN_IF" to any port 41641 proto udp >/dev/null 2>&1; then
-        info "Allowed UDP/41641 on $WAN_IF for direct tailscale links."
+        # in  : exit-node traffic and tailnet -> LAN (subnet router)
+        # out : return path and LAN -> tailnet
+        ufw route allow in on tailscale0  >/dev/null 2>&1 || true
+        ufw route allow out on tailscale0 >/dev/null 2>&1 || true
+        info "  forwarding allowed in/out of tailscale0."
+    fi
+
+    if [ "$TS_DIRECT_UDP" = "1" ] && [ -n "$WAN_IF" ]; then
+        if ufw allow in on "$WAN_IF" to any port 41641 proto udp >/dev/null 2>&1; then
+            info "  allowed UDP/41641 on $WAN_IF for direct tailscale links."
+        else
+            warn "  failed to allow UDP/41641 on $WAN_IF."
+        fi
     fi
 fi
 
@@ -533,7 +562,6 @@ fi
 # reboot never inherits bans or filters from an older version of this script.
 if [ "$HAVE_FAIL2BAN" = "1" ]; then
     info "Configuring fail2ban..."
-    install -d -m 0755 /etc/fail2ban/filter.d /etc/fail2ban/jail.d
 
     # 8.1 Remove artifacts left by older versions.
     rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
@@ -565,8 +593,7 @@ EOF
         UFW_JAIL_SOURCE="backend = systemd"
     fi
 
-    SSH_PORT_LIST="$(detect_ssh_ports | tr ' ' ',')"
-    SSH_PORT_LIST="${SSH_PORT_LIST%,}"
+    SSH_PORT_LIST="$(echo $SSH_PORTS | tr ' ' ',')"
 
     # 8.3 Jail definitions (jail.local is overwritten on every run)
     cat > /etc/fail2ban/jail.local <<EOF
@@ -655,8 +682,6 @@ chmod 0755 /etc/network/if-up.d/security-access
 info "Boot hook installed: /etc/network/if-up.d/security-access"
 
 ## 10. Show result
-ufw reload >/dev/null 2>&1 || true
-
 echo ""
 echo "=================================================="
 info "Current active UFW rules:"
