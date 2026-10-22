@@ -15,9 +15,9 @@
 #    - forward : UFW defaults it to DROP; re-opened only when NAT is detected
 #      so that guests keep their internet access.
 #
-# 2. Interface selection (why vmbr0 and not eno1)
+# 2. Interface selection (why vmbr0 and not end0)
 #    Traffic addressed to the host's bridge IP enters the input chain with
-#    IN=vmbr0. The physical member (e.g. "bridge-ports eno1") never matches,
+#    IN=vmbr0. The physical member (e.g. "bridge-ports end0") never matches,
 #    so per-port rules must be attached to the L3 interface, not the member.
 #
 # 3. Source selection
@@ -26,20 +26,29 @@
 #    /25 networks are handled correctly. An interface is only treated as LAN
 #    when it owns a private (RFC1918) address.
 #
-# 4. Order of operations
+# 4. Supported environments
+#    a) public address on vmbr0 : no management rule is added for that
+#       interface (tunnels only), the host stays reachable via tailscale0,
+#       CloudflareWARP or loopback (cloudflared).
+#    b) private address on vmbr0: the link subnet is allowed on 8006 and SSH.
+#    c) DHCP uplink bridged/NATed to vmbr0: the uplink holds a private address
+#       and is therefore trusted like any other LAN; stale source rules from a
+#       previous DHCP network are pruned, and NAT forwarding is preserved.
+#
+# 5. Order of operations
 #    allow rules -> legacy cleanup -> default policies -> ufw enable.
 #    Enabling UFW before the allow rules exist can lock the operator out.
-#
-# 5. Overlay paths
-#    - tailscale0 : 8006 + SSH from the tailnet.
-#    - cloudflared: the connector dials out and re-enters through loopback
-#      (lo); inside a container it arrives on docker0/br-* instead.
-#    - WARP/mesh  : CloudflareWARP / warp0 / cloudflared* tunnel interfaces.
 #
 # 6. Fail2ban safety
 #    A fail2ban ban is inserted at the top of the ufw chains and therefore
 #    overrides allow rules. RFC1918, CGNAT (100.64.0.0/10) and the Tailscale
 #    IPv6 prefix are listed in ignoreip so internal clients are never banned.
+#
+# 7. Self-update and boot hook
+#    /etc/network/if-up.d/security-access runs this file with --self-update on
+#    every interface up (boot, ifup, ifreload). The new version is downloaded,
+#    syntax checked with "bash -n" and moved into place; when the download
+#    fails the existing file is kept and used. No backups are kept.
 #===============================================================================
 set -euo pipefail
 
@@ -53,9 +62,77 @@ info() { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}$*${NC}"; }
 error() { echo -e "${RED}$*${NC}"; }
 
+#------------------------------------------------------------------------------
+# Self-update configuration and command line
+#------------------------------------------------------------------------------
+SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/FusionPlmH/resources/refs/heads/main/security-access.sh}"
+SELF_DEST="/usr/local/bin/security-access.sh"
+SELF_UPDATE_REQUESTED=0
+NO_SELF_INSTALL=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --self-update)     SELF_UPDATE_REQUESTED=1 ;;
+        --no-self-install) NO_SELF_INSTALL=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--self-update] [--no-self-install]"
+            echo "  --self-update      download, verify and replace $SELF_DEST, then re-exec"
+            echo "  --no-self-install  do not copy the running file to $SELF_DEST"
+            echo "Download URL can be overridden with SELF_URL=<url>."
+            echo "Set FORCE=1 to enable UFW even without any management path."
+            exit 0 ;;
+        *) warn "Unknown option: $arg" ;;
+    esac
+done
+
+# Download, validate and replace the local copy in place.
+# A short lived "<dest>.new" staging file is used so the running bash does not
+# read a truncated file; it is removed right after the successful mv.
+self_update() {
+    local tmp newf rc=1
+    tmp="$(mktemp /tmp/security-access.XXXXXX.sh)" || return 1
+    newf="${SELF_DEST}.new"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 5 --max-time 20 "$SELF_URL" -o "$tmp" && rc=0
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 20 -t 1 -O "$tmp" "$SELF_URL" && rc=0
+    fi
+
+    if [ "$rc" -ne 0 ] || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        warn "Self-update: download failed, keeping the current file."
+        return 1
+    fi
+
+    # Never replace a working copy with something bash cannot parse.
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        warn "Self-update: syntax check failed, keeping the current file."
+        return 1
+    fi
+
+    if [ -f "$SELF_DEST" ] && cmp -s "$tmp" "$SELF_DEST"; then
+        rm -f "$tmp"
+        info "Self-update: already up to date."
+        return 0
+    fi
+
+    if install -m 0755 "$tmp" "$newf" && mv -f "$newf" "$SELF_DEST"; then
+        rm -f "$tmp"
+        info "Self-update: $SELF_DEST replaced."
+        return 0
+    fi
+
+    rm -f "$tmp" "$newf"
+    warn "Self-update: write failed, keeping the current file."
+    return 1
+}
+
 PVE_PORT="${PVE_PORT:-8006}"
 TS_SUBNET_ROUTING="${TS_SUBNET_ROUTING:-0}"
 TS_DIRECT_UDP="${TS_DIRECT_UDP:-0}"
+FORCE="${FORCE:-0}"
 
 echo -e "${GREEN}"
 echo "        Security access only for"
@@ -68,6 +145,15 @@ echo -e "${NC}"
 if [ "$EUID" -ne 0 ]; then
   error "Error: Please run this script with root privileges (e.g. sudo)."
   exit 1
+fi
+
+# 0.1 Self-update (requested by the if-up.d hook)
+if [ "$SELF_UPDATE_REQUESTED" = "1" ] && [ "${SECURITY_ACCESS_SELF_UPDATED:-0}" != "1" ]; then
+    self_update || true
+    if [ -x "$SELF_DEST" ]; then
+        # Run the freshly installed copy once; the env flag prevents a loop.
+        SECURITY_ACCESS_SELF_UPDATED=1 exec "$SELF_DEST" "$@"
+    fi
 fi
 
 ## 1. Check support and install package
@@ -122,6 +208,10 @@ iface_v4_addrs() {
     ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4}'
 }
 
+iface_first_v4() {
+    iface_v4_addrs "$1" | head -n1 | cut -d/ -f1
+}
+
 # Actual listening SSH port(s) so a non-default port keeps working.
 detect_ssh_ports() {
     local ports=""
@@ -132,6 +222,29 @@ detect_ssh_ports() {
             | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)
     fi
     echo "${ports:-22 }"
+}
+
+# True when this host performs IPv4 NAT for its guests. The live ruleset is
+# authoritative; the ifupdown files are only a fallback.
+has_nat() {
+    if command -v iptables-save >/dev/null 2>&1; then
+        if iptables-save -t nat 2>/dev/null \
+           | grep -qE '^-A POSTROUTING .* -j (MASQUERADE|SNAT)( |$)'; then
+            return 0
+        fi
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        if nft list ruleset 2>/dev/null \
+           | grep -qE '(^|[[:space:]])(masquerade|snat to)([[:space:]]|$)'; then
+            return 0
+        fi
+    fi
+    if grep -rhE '^[[:space:]]*(pre-up|post-up|pre-down|post-down)[[:space:]].*(MASQUERADE|SNAT)' \
+            /etc/network/interfaces /etc/network/interfaces.d/ /etc/iptables/ 2>/dev/null \
+       | grep -q .; then
+        return 0
+    fi
+    return 1
 }
 
 # Allowed TCP ports: Proxmox web UI plus every real SSH port.
@@ -157,7 +270,7 @@ allow_mgmt() {
             ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 \
                 || warn "  failed: allow in on $ifc port $port"
         fi
-        # Documentation value while the default outbound policy stays ACCEPT.
+        # Documentation value while the default outbound policy is ACCEPT.
         ufw allow out on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
     done
 }
@@ -177,6 +290,9 @@ delete_rules_matching() {
 }
 
 MANAGED_IFACES=()
+LAN_IFACES=()
+OVERLAY_FOUND=0
+
 add_managed() {
     local entry="$1|${2:-}" existing
     for existing in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
@@ -185,6 +301,44 @@ add_managed() {
         fi
     done
     MANAGED_IFACES+=("$entry")
+}
+
+# Remove interface scoped source rules whose subnet no longer matches the
+# interface (DHCP moved to another network). Only management ports are
+# considered, only interfaces that still exist and hold an address, so a link
+# that is temporarily down keeps its rules.
+prune_stale_source_rules() {
+    local num port rule_ifc src allowed nets
+    local -a stale=()
+
+    while IFS='|' read -r num port rule_ifc src; do
+        if [ -z "$num" ]; then continue; fi
+
+        allowed=0
+        for pinned in "${ALLOW_PORTS[@]}"; do
+            if [ "$port" = "$pinned" ]; then allowed=1; fi
+        done
+        if [ "$allowed" -ne 1 ]; then continue; fi
+
+        if ! iface_exists "$rule_ifc"; then continue; fi
+        if [ -z "$(iface_v4_addrs "$rule_ifc")" ]; then continue; fi
+
+        nets=" $(iface_v4_nets "$rule_ifc" | tr '\n' ' ') "
+        case "$nets" in
+            *" $src "*) ;;
+            *) stale+=("$num|$port|$rule_ifc|$src") ;;
+        esac
+    done < <(ufw status numbered 2>/dev/null | sed -nE \
+        's/^\[ *([0-9]+)\] +([0-9]+)\/tcp +on ([^ ]+) +ALLOW IN +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+).*$/\1|\2|\3|\4/p')
+
+    if [ "${#stale[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    while IFS='|' read -r num port rule_ifc src; do
+        ufw --force delete "$num" >/dev/null 2>&1 || true
+        info "  pruned stale rule: ${port}/tcp on $rule_ifc from $src"
+    done < <(printf '%s\n' "${stale[@]}" | sort -t'|' -k1,1 -rn)
 }
 
 ## 3. Collect managed interfaces
@@ -205,7 +359,7 @@ while read -r ifc; do
     done <<< "$(iface_v4_nets "$ifc")"
 
     # Fallback when no scope-link route is present: allow any source, still
-    # limited to the two management ports.
+    # limited to the management ports.
     if [ "$matched" -eq 0 ]; then
         while read -r addr; do
             if [ -z "$addr" ]; then continue; fi
@@ -217,6 +371,7 @@ while read -r ifc; do
     fi
 
     if [ "$matched" -eq 1 ]; then
+        LAN_IFACES+=("$ifc")
         info "  LAN interface: $ifc"
     fi
 done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sort -u)
@@ -225,6 +380,7 @@ done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sort -
 for ifc in tailscale0 CloudflareWARP warp0 cloudflared; do
     if iface_exists "$ifc"; then
         add_managed "$ifc" ""
+        OVERLAY_FOUND=1
         info "  Overlay interface: $ifc"
     fi
 done
@@ -233,6 +389,7 @@ while read -r ifc; do
     case "$ifc" in
         warp*|cloudflared*|CloudflareWARP*)
             add_managed "$ifc" ""
+            OVERLAY_FOUND=1
             info "  Overlay interface: $ifc"
             ;;
     esac
@@ -251,8 +408,29 @@ while read -r ifc; do
     esac
 done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ' | sort -u)
 
+# 3.4 Classify the uplink so the log shows which environment was detected.
+WAN_IF="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+if [ -n "$WAN_IF" ]; then
+    WAN_ADDR="$(iface_first_v4 "$WAN_IF")"
+    if [ -z "$WAN_ADDR" ]; then
+        info "  Uplink $WAN_IF has no IPv4 address."
+    elif is_private_v4 "$WAN_ADDR"; then
+        info "  Uplink $WAN_IF is private ($WAN_ADDR): treated as LAN."
+    else
+        info "  Uplink $WAN_IF is public ($WAN_ADDR): management ports stay closed."
+    fi
+fi
+
 if [ "${#MANAGED_IFACES[@]}" -eq 0 ]; then
     error "No manageable interface found, aborting to avoid a lockout."
+    exit 1
+fi
+
+# Refuse to enable a firewall that would leave no management path at all.
+if [ "${#LAN_IFACES[@]}" -eq 0 ] && [ "$OVERLAY_FOUND" -eq 0 ] && [ "$FORCE" != "1" ]; then
+    error "No LAN interface and no tailscale/cloudflared interface detected."
+    error "Enabling UFW would leave the host reachable through loopback only."
+    error "Re-run with FORCE=1 to override."
     exit 1
 fi
 
@@ -269,16 +447,19 @@ for entry in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
 done
 
 ## 5. Cleanup legacy rules
-# Only rules without an interface qualifier are removed; the interface-scoped
-# rules created above can never match this pattern.
 echo "Checking existing UFW rules for legacy entries..."
+
+# 5.1 Remove bare (interface less) rules for the management port.
 delete_rules_matching '^\[ *[0-9]+\] +(8006|8006/tcp) +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
 
-# Rules attached to a bridge member (eno1, ...) can never match host traffic.
+# 5.2 Rules attached to a bridge member (end0, ...) can never match host traffic.
 for member in $(awk '/^[[:space:]]*bridge-ports[[:space:]]/ {for (i=2; i<=NF; i++) if ($i != "none") print $i}' \
                     /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | sort -u || true); do
     delete_rules_matching "^\\[ *[0-9]+\\] +(8006|8006/tcp) +on ${member} +ALLOW IN"
 done
+
+# 5.3 Drop source rules from a previous DHCP network.
+prune_stale_source_rules
 
 ## 6. Default policies and enable UFW
 echo "Initializing UFW policies..."
@@ -290,19 +471,30 @@ ufw logging low >/dev/null
 ufw --force enable >/dev/null
 info "UFW enabled; inbound limited to ${ALLOW_PORTS[*]}."
 
-## 7. Preserve forwarding
-WAN_IF="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-
-# Internal NAT hosts must keep vmbr0 -> WAN forwarding, otherwise guests lose
-# their internet access once the forward policy becomes DROP.
-if grep -rqE '(post-up|pre-up|post-down).*MASQUERADE' /etc/network/interfaces /etc/network/interfaces.d/ 2>/dev/null; then
-    if [ -n "$WAN_IF" ] && [ "$WAN_IF" != "vmbr0" ] && iface_exists vmbr0; then
-        if ufw route allow in on vmbr0 out on "$WAN_IF" >/dev/null 2>&1; then
-            info "Preserved vmbr0 -> $WAN_IF forwarding for NAT."
-        else
-            warn "Could not add the NAT forwarding rule."
+## 7. Preserve forwarding for NAT setups
+if has_nat; then
+    if [ -z "$WAN_IF" ]; then
+        warn "NAT detected but no default route found; forwarding rule not added."
+    else
+        if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" != "1" ]; then
+            warn "net.ipv4.ip_forward is 0: guests cannot be routed."
         fi
+        info "NAT detected; preserving forwarding towards $WAN_IF."
+        for ifc in ${LAN_IFACES[@]+"${LAN_IFACES[@]}"}; do
+            if [ "$ifc" = "$WAN_IF" ]; then
+                continue
+            fi
+            if ufw route allow in on "$ifc" out on "$WAN_IF" >/dev/null 2>&1; then
+                info "  route allow: $ifc -> $WAN_IF"
+            else
+                warn "  route allow failed: $ifc -> $WAN_IF"
+            fi
+        done
+        # Same-bridge NAT is not covered here; add it manually if needed:
+        #   ufw route allow in on "$WAN_IF" out on "$WAN_IF"
     fi
+else
+    info "No NAT detected; forwarding stays at 'deny (routed)'."
 fi
 
 # Optional: tailscale subnet router / exit node.
@@ -387,41 +579,35 @@ EOF
 fi
 
 ## 9. Persist on boot
-# Run the local copy only: no network access is required and a failure can no
-# longer prevent vmbr0 from coming up.
+# $SELF_DEST is only a cache: /etc/network/if-up.d/security-access calls it
+# with --self-update on every ifup, so each boot or network restart overwrites
+# it with the newest upstream version first.
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || true)"
-if [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ] && [ "$SELF_PATH" != "/usr/local/bin/security-access.sh" ]; then
-    install -m 0755 "$SELF_PATH" /usr/local/bin/security-access.sh
-    info "Installed this script to /usr/local/bin/security-access.sh"
+if [ "$NO_SELF_INSTALL" != "1" ] \
+   && [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ] && [ "$SELF_PATH" != "$SELF_DEST" ]; then
+    install -m 0755 "$SELF_PATH" "$SELF_DEST"
+    info "Installed this script to $SELF_DEST"
 fi
 
-if [ -f /etc/network/interfaces ]; then
-    if grep -q "security-access" /etc/network/interfaces; then
-        info "post-up hook already present, skipping."
-    elif ! grep -qE '^[[:space:]]*iface[[:space:]]+vmbr0([[:space:]]|$)' /etc/network/interfaces; then
-        warn "No vmbr0 stanza found, skipping post-up hook."
-    else
-        cp -a /etc/network/interfaces "/etc/network/interfaces.bak.$(date +%Y%m%d-%H%M%S)"
-        hook='        post-up    /usr/local/bin/security-access.sh > /var/log/security-access.log 2>&1 || true'
-        # Insert inside the vmbr0 stanza only, after bridge-fd 0 when present.
-        awk -v hook="$hook" '
-            BEGIN { in_vmbr0 = 0; done = 0 }
-            /^[[:space:]]*iface[[:space:]]+vmbr0([[:space:]]|$)/ { in_vmbr0 = 1; print; next }
-            in_vmbr0 && !done && /^[[:space:]]*bridge-fd[[:space:]]+0([[:space:]]|$)/ { print; print hook; done = 1; next }
-            in_vmbr0 && !done && /^[[:space:]]*$/ { print hook; done = 1 }
-            /^[[:space:]]*$/ { in_vmbr0 = 0 }
-            { print }
-        ' /etc/network/interfaces > /etc/network/interfaces.tmp
-
-        if grep -q "security-access" /etc/network/interfaces.tmp; then
-            mv /etc/network/interfaces.tmp /etc/network/interfaces
-            info "post-up hook added to the vmbr0 stanza."
-        else
-            rm -f /etc/network/interfaces.tmp
-            warn "Hook insertion was not safe, original file left untouched."
-        fi
-    fi
+# Delete the legacy post-up hook: PVE rewrites /etc/network/interfaces from its
+# own model, so a hook stored there disappears on the next GUI change.
+if grep -q '^[[:space:]]*post-up.*security-access' /etc/network/interfaces 2>/dev/null; then
+    sed -i '/^[[:space:]]*post-up.*security-access/d' /etc/network/interfaces
+    info "Removed the legacy post-up hook from /etc/network/interfaces."
 fi
+
+# if-up.d runs on every interface up and is not managed by the PVE network
+# stack. It always exits 0 so a failure can never block network setup.
+install -d -m 0755 /etc/network/if-up.d
+cat > /etc/network/if-up.d/security-access <<'EOF'
+#!/bin/sh
+[ "$IFACE" = "vmbr0" ] || exit 0
+[ "$MODE" = "start" ] || exit 0
+/usr/local/bin/security-access.sh --self-update >/var/log/security-access.log 2>&1 || true
+exit 0
+EOF
+chmod 0755 /etc/network/if-up.d/security-access
+info "Boot hook installed: /etc/network/if-up.d/security-access"
 
 ## 10. Show result
 ufw reload >/dev/null 2>&1 || true
