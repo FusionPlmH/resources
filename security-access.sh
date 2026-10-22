@@ -43,6 +43,8 @@
 #    A fail2ban ban is inserted at the top of the ufw chains and therefore
 #    overrides allow rules. RFC1918, CGNAT (100.64.0.0/10) and the Tailscale
 #    IPv6 prefix are listed in ignoreip so internal clients are never banned.
+#    Every run also rewrites the jail definitions, deletes legacy filter/jail
+#    artifacts and clears all active bans, so a reboot never inherits state.
 #
 # 7. Self-update and boot hook
 #    /etc/network/if-up.d/security-access runs this file with --self-update on
@@ -80,6 +82,7 @@ for arg in "$@"; do
             echo "  --no-self-install  do not copy the running file to $SELF_DEST"
             echo "Download URL can be overridden with SELF_URL=<url>."
             echo "Set FORCE=1 to enable UFW even without any management path."
+            echo "Set FAIL2BAN_PURGE_DB=1 to also delete the fail2ban ban database."
             exit 0 ;;
         *) warn "Unknown option: $arg" ;;
     esac
@@ -308,7 +311,7 @@ add_managed() {
 # considered, only interfaces that still exist and hold an address, so a link
 # that is temporarily down keeps its rules.
 prune_stale_source_rules() {
-    local num port rule_ifc src allowed nets
+    local num port rule_ifc src allowed nets pinned
     local -a stale=()
 
     while IFS='|' read -r num port rule_ifc src; do
@@ -446,16 +449,29 @@ for entry in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
     allow_mgmt "${entry%%|*}" "${entry#*|}"
 done
 
-## 5. Cleanup legacy rules
+## 5. Cleanup legacy rules (only leftovers created by older versions)
 echo "Checking existing UFW rules for legacy entries..."
 
-# 5.1 Remove bare (interface less) rules for the management port.
-delete_rules_matching '^\[ *[0-9]+\] +(8006|8006/tcp) +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
+# 5.1 Bare (interface less) rules created by the first version: 443/HTTPS and
+#     the unqualified 8006. Rules for other ports are never touched.
+delete_rules_matching '^\[ *[0-9]+\] +(443|443/tcp|https)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
+delete_rules_matching '^\[ *[0-9]+\] +(8006|8006/tcp)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
 
-# 5.2 Rules attached to a bridge member (end0, ...) can never match host traffic.
-for member in $(awk '/^[[:space:]]*bridge-ports[[:space:]]/ {for (i=2; i<=NF; i++) if ($i != "none") print $i}' \
-                    /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | sort -u || true); do
-    delete_rules_matching "^\\[ *[0-9]+\\] +(8006|8006/tcp) +on ${member} +ALLOW IN"
+# 5.2 Older versions attached the management rules to the bridge MEMBER
+#     (end0, eno1, ...) instead of the bridge itself, and opened the overlay
+#     interfaces without any port filter. Both are dead weight now.
+BRIDGE_MEMBERS="$(awk '/^[[:space:]]*bridge-ports[[:space:]]/ {for (i=2; i<=NF; i++) if ($i != "none") print $i}' \
+                       /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | sort -u || true)"
+for member in $BRIDGE_MEMBERS; do
+    for p in "${ALLOW_PORTS[@]}"; do
+        delete_rules_matching "^\\[ *[0-9]+\\] +(${p}|${p}/tcp)( \\(v6\\))? +on ${member} +ALLOW (IN|OUT)"
+    done
+done
+
+# Legacy "allow everything" rules on the overlay interfaces, e.g. the old
+# "ufw allow in on CloudflareWARP to any" / "ufw allow out on tailscale0 to any".
+for ovl in tailscale0 CloudflareWARP warp0 cloudflared; do
+    delete_rules_matching "^\\[ *[0-9]+\\] +Anywhere( \\(v6\\))? +on ${ovl} +ALLOW (IN|OUT) +Anywhere( \\(v6\\))? *\$"
 done
 
 # 5.3 Drop source rules from a previous DHCP network.
@@ -513,10 +529,23 @@ if [ "$TS_DIRECT_UDP" = "1" ] && [ -n "$WAN_IF" ] && iface_exists tailscale0; th
 fi
 
 ## 8. Setting up fail2ban
+# The configuration is rewritten and the ban state is purged on every run, so a
+# reboot never inherits bans or filters from an older version of this script.
 if [ "$HAVE_FAIL2BAN" = "1" ]; then
     info "Configuring fail2ban..."
     install -d -m 0755 /etc/fail2ban/filter.d /etc/fail2ban/jail.d
 
+    # 8.1 Remove artifacts left by older versions.
+    rm -f /etc/fail2ban/filter.d/ufw-aggressive.conf
+    for snippet in /etc/fail2ban/jail.d/*.conf; do
+        [ -f "$snippet" ] || continue
+        if grep -q 'ufw-aggressive' "$snippet" 2>/dev/null; then
+            rm -f "$snippet"
+            info "  removed legacy jail snippet: $snippet"
+        fi
+    done
+
+    # 8.2 Filters
     cat > /etc/fail2ban/filter.d/proxmox.conf <<'EOF'
 [Definition]
 failregex = ^.*pveproxy\[\d+\]: authentication failure; rhost=<HOST> user=.*$
@@ -539,6 +568,7 @@ EOF
     SSH_PORT_LIST="$(detect_ssh_ports | tr ' ' ',')"
     SSH_PORT_LIST="${SSH_PORT_LIST%,}"
 
+    # 8.3 Jail definitions (jail.local is overwritten on every run)
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 # Internal, CGNAT and Tailscale ranges must never be banned: a ban is inserted
@@ -571,10 +601,25 @@ maxretry = 5
 EOF
 
     systemctl enable fail2ban >/dev/null 2>&1 || true
+
+    # 8.4 Optional: delete the ban database as well (FAIL2BAN_PURGE_DB=1).
+    if [ "${FAIL2BAN_PURGE_DB:-0}" = "1" ]; then
+        systemctl stop fail2ban >/dev/null 2>&1 || true
+        rm -f /var/lib/fail2ban/fail2ban.sqlite3
+        warn "  fail2ban database purged; check for orphan 'DENY' rules afterwards."
+    fi
+
     if systemctl restart fail2ban >/dev/null 2>&1; then
         info "fail2ban restarted."
     else
         warn "fail2ban restart failed; see /var/log/fail2ban.log."
+    fi
+
+    # 8.5 Purge every active ban: a reboot must never inherit a stale ban.
+    #     The ufw action also removes the matching "deny" rule.
+    if fail2ban-client ping >/dev/null 2>&1; then
+        fail2ban-client unban --all >/dev/null 2>&1 || true
+        info "  all fail2ban bans cleared."
     fi
 fi
 
