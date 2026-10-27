@@ -56,10 +56,20 @@
 #    clears all active bans, so a reboot never inherits state.
 #
 # 8. Self-update and boot hook
-#    /etc/network/if-up.d/security-access runs this file with --self-update
-#    when the management bridge or the current uplink comes up. The new version
-#    is downloaded, syntax checked with "bash -n" and moved into place; when
-#    the download fails the existing file is kept and used.
+#    The boot hook NEVER runs this file inside the ifup transaction.
+#    networking.service is ordered Before=network.target and fail2ban.service
+#    is ordered After=network.target, so a synchronous "systemctl restart
+#    fail2ban" issued from an ifup hook deadlocks the entire boot: networking
+#    never finishes, network.target is never reached, ssh/pveproxy never start
+#    and the host is unreachable after every reboot - with correct firewall
+#    rules, which is what makes this failure so hard to read.
+#    /etc/network/if-up.d/security-access therefore only enqueues
+#    "systemctl start --no-block security-access.service"; that oneshot unit
+#    runs this file with --self-update after network-online.target and
+#    fail2ban.service. Every systemctl call made here also uses --no-block, so
+#    the script stays safe even when it is started from another hook.
+#    The new version is downloaded, syntax checked with "bash -n" and moved
+#    into place; when the download fails the existing file is kept and used.
 #    Exactly one copy of the script is kept: $SELF_DEST. Any leftover
 #    ".bak" / ".old" / ".new" copies are deleted on every run.
 #===============================================================================
@@ -99,6 +109,7 @@ for arg in "$@"; do
             echo "  --no-self-install  do not copy the running file to $SELF_DEST"
             echo "Environment:"
             echo "  SELF_URL=<url>            override the download source"
+            echo "  SSH_PORTS_OVERRIDE=22,222 pin the allowed SSH ports (the boot probe cannot see sshd)"
             echo "  FORCE=1                   enable UFW even without a management path"
             echo "  TS_SUBNET_ROUTING=0       skip exit-node / subnet-router forwarding"
             echo "  TS_DIRECT_UDP=0           skip inbound UDP/41641 for direct peers"
@@ -179,7 +190,10 @@ check_and_install() {
     local package=$1
     if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
         warn "Installing $package..."
-        if ! { apt-get update -qq && apt-get install -y -qq "$package" >/dev/null 2>&1; }; then
+        # Bounded on purpose: this may run from the boot path, an apt that waits
+        # for a dead network would stall networking.service as well.
+        if ! { apt-get -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=1 update -qq \
+               && apt-get -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=1 install -y -qq "$package" >/dev/null 2>&1; }; then
             error "Failed to install $package."
             return 1
         fi
@@ -276,7 +290,10 @@ has_nat() {
 }
 
 # Allowed TCP ports: Proxmox web UI plus every real SSH port.
-SSH_PORTS="$(detect_ssh_ports)"
+# During early boot sshd is not listening yet, so the probe above always falls
+# back to 22; set SSH_PORTS_OVERRIDE when sshd runs on another port, otherwise
+# the boot run would open the wrong port and lock the operator out.
+SSH_PORTS="${SSH_PORTS_OVERRIDE:-$(detect_ssh_ports)}"
 ALLOW_PORTS=("$PVE_PORT")
 for port in $SSH_PORTS; do
     if [ "$port" != "$PVE_PORT" ]; then
@@ -607,6 +624,19 @@ EOF
 
     SSH_PORT_LIST="$(echo $SSH_PORTS | tr ' ' ',')"
 
+    # The [ufw] jail needs the ufw binary; without it every ban attempt fails
+    # and fail2ban logs an error on each match.
+    if command -v ufw >/dev/null 2>&1; then
+        UFW_JAIL_BLOCK="[ufw]
+enabled  = true
+filter   = ufw-management
+action   = ufw
+${UFW_JAIL_SOURCE}
+maxretry = 5"
+    else
+        UFW_JAIL_BLOCK="# [ufw] jail skipped: the ufw binary is not installed"
+    fi
+
     # 8.3 Jail definitions (jail.local is overwritten on every run)
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -631,12 +661,7 @@ filter   = proxmox
 backend  = systemd
 maxretry = 3
 
-[ufw]
-enabled  = true
-filter   = ufw-management
-action   = ufw
-${UFW_JAIL_SOURCE}
-maxretry = 5
+${UFW_JAIL_BLOCK}
 EOF
 
     systemctl enable fail2ban >/dev/null 2>&1 || true
@@ -648,8 +673,11 @@ EOF
         warn "  fail2ban database purged; check for orphan 'DENY' rules afterwards."
     fi
 
-    if systemctl restart fail2ban >/dev/null 2>&1; then
-        info "fail2ban restarted."
+    # --no-block is mandatory. The fail2ban start job can only be satisfied
+    # after network.target, and this script may be running inside
+    # networking.service (Before=network.target): waiting here deadlocks boot.
+    if systemctl restart --no-block fail2ban >/dev/null 2>&1; then
+        info "fail2ban restart requested (non-blocking)."
     else
         warn "fail2ban restart failed; see /var/log/fail2ban.log."
     fi
@@ -693,12 +721,13 @@ if grep -q '^[[:space:]]*post-up.*security-access' /etc/network/interfaces 2>/de
 fi
 
 # if-up.d runs on every interface up and is not managed by the PVE network
-# stack. Only the management bridge and the current uplink are worth a run;
-# everything else would just repeat an idempotent execution.
+# stack. It must only ENQUEUE the real work: running this script synchronously
+# from here blocks networking.service, see section 8 of the header.
 install -d -m 0755 /etc/network/if-up.d
 cat > /etc/network/if-up.d/security-access <<'EOF'
 #!/bin/sh
 [ "$MODE" = "start" ] || exit 0
+[ -x /usr/local/bin/security-access.sh ] || exit 0
 
 run=0
 case "$IFACE" in
@@ -712,11 +741,33 @@ case "$IFACE" in
 esac
 [ "$run" -eq 1 ] || exit 0
 
-/usr/local/bin/security-access.sh --self-update > /var/log/security-access.log 2>&1 || true
+# --no-block: the job waits for network-online.target, ifup does not wait.
+/usr/bin/systemctl start --no-block security-access.service >/dev/null 2>&1 || exit 0
 exit 0
 EOF
 chmod 0755 /etc/network/if-up.d/security-access
-info "Boot hook installed: /etc/network/if-up.d/security-access"
+
+# The unit that actually applies the rules. It is ordered after the boot
+# network and after fail2ban, so no ordering cycle can form.
+cat > /etc/systemd/system/security-access.service <<'EOF'
+[Unit]
+Description=Apply security-access firewall rules
+Documentation=https://github.com/FusionPlmH/resources
+After=network-online.target fail2ban.service
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/security-access.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/security-access.sh --self-update
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable security-access.service >/dev/null 2>&1 || true
+info "Boot hook installed: if-up.d hook + security-access.service"
 
 ## 10. Show result
 echo ""
