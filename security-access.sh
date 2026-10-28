@@ -115,6 +115,10 @@ for arg in "$@"; do
             echo "  TS_DIRECT_UDP=0           skip inbound UDP/41641 for direct peers"
             echo "  TS_IPV6_FORWARDING=1      also enable IPv6 forwarding"
             echo "  FAIL2BAN_PURGE_DB=1       delete the fail2ban ban database"
+            echo "  LEGACY_CLEANUP=1          force the one-time legacy rule cleanup again"
+            echo "  UFW_IPV6=no|yes           set IPV6 in /etc/default/ufw (default: keep)"
+            echo "  SELFCHECK=0               skip the post-apply management path check"
+            echo "  SELFCHECK_FATAL=0         warn instead of disabling UFW when it fails"
             exit 0 ;;
         *) warn "Unknown option: $arg" ;;
     esac
@@ -129,7 +133,19 @@ self_update() {
     newf="${SELF_DEST}.new"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 5 --max-time 20 "$SELF_URL" -o "$tmp" && rc=0
+        # -z (If-Modified-Since) skips the transfer when the cached copy is
+        # already current, so a NIC flap does not depend on GitHub.
+        if [ -f "$SELF_DEST" ]; then
+            curl -fsSL -z "$SELF_DEST" --connect-timeout 5 --max-time 20 \
+                "$SELF_URL" -o "$tmp" && rc=0
+            if [ "$rc" -eq 0 ] && [ ! -s "$tmp" ]; then
+                rm -f "$tmp"
+                info "Self-update: already up to date."
+                return 0
+            fi
+        else
+            curl -fsSL --connect-timeout 5 --max-time 20 "$SELF_URL" -o "$tmp" && rc=0
+        fi
     elif command -v wget >/dev/null 2>&1; then
         wget -q -T 20 -t 1 -O "$tmp" "$SELF_URL" && rc=0
     fi
@@ -275,8 +291,11 @@ has_nat() {
             return 0
         fi
     fi
+    # Only the POSTROUTING chain counts. Grepping the whole ruleset also hits
+    # overlay masquerade rules (tailscale's ts-postrouting) and would wrongly
+    # widen FORWARD for every private bridge.
     if command -v nft >/dev/null 2>&1; then
-        if nft list ruleset 2>/dev/null \
+        if nft list chain ip nat POSTROUTING 2>/dev/null \
            | grep -qE '(^|[[:space:]])(masquerade|snat to)([[:space:]]|$)'; then
             return 0
         fi
@@ -294,6 +313,9 @@ has_nat() {
 # back to 22; set SSH_PORTS_OVERRIDE when sshd runs on another port, otherwise
 # the boot run would open the wrong port and lock the operator out.
 SSH_PORTS="${SSH_PORTS_OVERRIDE:-$(detect_ssh_ports)}"
+# Accept both "22 222" and "22,222"; a comma separated value would otherwise
+# be passed to ufw as a single invalid port token.
+SSH_PORTS="${SSH_PORTS//,/ }"
 ALLOW_PORTS=("$PVE_PORT")
 for port in $SSH_PORTS; do
     if [ "$port" != "$PVE_PORT" ]; then
@@ -345,10 +367,27 @@ allow_mgmt() {
     done
 }
 
+# "ufw status numbered" walks and prints the whole rule set, which gets slow
+# once hundreds of rules exist. Cache it and invalidate after every change.
+UFW_STATUS_CACHE=""
+ufw_rules() {
+    if [ -z "$UFW_STATUS_CACHE" ]; then
+        UFW_STATUS_CACHE="$(ufw status numbered 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$UFW_STATUS_CACHE"
+}
+ufw_rules_invalidate() { UFW_STATUS_CACHE=""; }
+
+# Bridge member interfaces (end0, eno1, ...) from the ifupdown files.
+bridge_members() {
+    awk '/^[[:space:]]*bridge-ports[[:space:]]/ {for (i=2; i<=NF; i++) if ($i != "none") print $i}' \
+        /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | sort -u || true
+}
+
 # Delete rules by pattern, highest index first so numbering does not shift.
 delete_rules_matching() {
     local pattern="$1" numbers number
-    numbers=$(ufw status numbered 2>/dev/null \
+    numbers=$(ufw_rules \
         | grep -E "$pattern" \
         | sed -nE 's/^\[ *([0-9]+)\].*/\1/p' | sort -rn || true)
     if [ -z "$numbers" ]; then
@@ -357,6 +396,118 @@ delete_rules_matching() {
     for number in $numbers; do
         ufw --force delete "$number" >/dev/null 2>&1 || true
     done
+    ufw_rules_invalidate
+}
+
+# fail2ban's "ufw" action writes a persistent REJECT rule per ban. When its
+# database is reset (this script restarts fail2ban on every run) those rules
+# stay behind untracked, so "unban --all" can never remove them again. They
+# then override every allow rule at boot and make each ufw call rewrite a
+# huge file. Drop every ban tuple that carries fail2ban's comment marker.
+purge_ban_tuples() {
+    local f=/etc/ufw/user.rules before after tmp
+    [ -f "$f" ] || return 0
+    before=$(grep -c 'in comment=' "$f" 2>/dev/null || true)
+    [ "${before:-0}" -gt 0 ] || return 0
+
+    tmp="$(mktemp)" || return 0
+    awk '
+        /^### tuple ### reject any any 0\.0\.0\.0\/0 any .* in comment=/ { pending=1; next }
+        { if (pending==1 && $0 ~ /^-A ufw-user-input -s .* -j REJECT$/) { pending=0; next }
+          pending=0; print }
+    ' "$f" > "$tmp" || { rm -f "$tmp"; return 0; }
+
+    after=$(grep -c 'in comment=' "$tmp" 2>/dev/null || true)
+    if [ "${after:-0}" -gt 0 ]; then
+        warn "  could not purge all ban tuples ($before -> $after); keeping the file."
+        rm -f "$tmp"
+        return 0
+    fi
+    if cmp -s "$tmp" "$f"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    cp -a "$f" "${f}.bak" 2>/dev/null || true
+    if mv -f "$tmp" "$f"; then
+        info "  purged ${before} stale fail2ban ban tuple(s) from user.rules."
+        NEED_UFW_RELOAD=1
+    else
+        rm -f "$tmp"
+        warn "  failed to rewrite $f; stale bans left in place."
+    fi
+    ufw_rules_invalidate
+}
+
+# Rules that point at an overlay interface which is gone for good (WARP
+# uninstalled or disabled) can never match again. Only prune when the owning
+# service is really gone, never while it is merely down: a boot race must not
+# delete the tailscale rules that the host depends on.
+prune_dead_iface_rules() {
+    local ifc svc
+    for ifc in CloudflareWARP warp0 cloudflared; do
+        case "$ifc" in
+            cloudflared) svc=cloudflared ;;
+            *)           svc=warp-svc ;;
+        esac
+        iface_exists "$ifc" && continue
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null \
+           || systemctl is-active --quiet "$svc" 2>/dev/null; then
+            continue
+        fi
+        delete_rules_matching "^\\[ *[0-9]+\\] +.* +on ${ifc} +ALLOW (IN|OUT)"
+    done
+    if ! iface_exists tailscale0 && ! systemctl is-enabled --quiet tailscaled 2>/dev/null; then
+        delete_rules_matching "^\\[ *[0-9]+\\] +.* +on tailscale[0-9]* +ALLOW (IN|OUT)"
+    fi
+}
+
+# Write stdin to $1 only when the content differs. Leaves IFC_CHANGED=1 when the
+# file was replaced, so daemon-reload / service restarts can be skipped.
+IFC_CHANGED=0
+install_if_changed() {
+    local dest="$1" mode="${2:-0644}" tmp
+    IFC_CHANGED=0
+    tmp="$(mktemp)" || return 1
+    cat > "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    if install -m "$mode" "$tmp" "$dest"; then
+        IFC_CHANGED=1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# Refuse to stay enabled without any management path. A wrong regex or a
+# missing interface must not end as a locked-out host.
+post_apply_selfcheck() {
+    local port live missing=0
+    if [ "${SELFCHECK:-1}" = "0" ]; then
+        return 0
+    fi
+    live="$(iptables -S ufw-user-input 2>/dev/null || true)"
+    if [ -z "$live" ]; then
+        warn "self-check: cannot read ufw-user-input; skipped."
+        return 0
+    fi
+    for port in "${ALLOW_PORTS[@]}"; do
+        if ! printf '%s\n' "$live" | grep -qE -- "--dport ${port}( |\$).*-j ACCEPT"; then
+            error "self-check: no ACCEPT rule for port ${port}."
+            missing=1
+        fi
+    done
+    if [ "$missing" -eq 0 ]; then
+        info "Self-check passed: ${ALLOW_PORTS[*]}/tcp still reachable."
+        return 0
+    fi
+    if [ "${SELFCHECK_FATAL:-1}" = "1" ]; then
+        error "No management path left; disabling UFW instead of locking out."
+        ufw --force disable >/dev/null 2>&1 || true
+        exit 1
+    fi
+    warn "self-check failed (SELFCHECK_FATAL=0): UFW left enabled."
 }
 
 # Remove interface-scoped source rules whose subnet no longer matches the
@@ -378,7 +529,7 @@ prune_stale_source_rules() {
             *" $src "*) ;;
             *) stale+=("$num|$port|$rule_ifc|$src") ;;
         esac
-    done < <(ufw status numbered 2>/dev/null | sed -nE \
+    done < <(ufw_rules | sed -nE \
         's/^\[ *([0-9]+)\] +([0-9]+)\/tcp +on ([^ ]+) +ALLOW IN +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+).*$/\1|\2|\3|\4/p')
 
     if [ "${#stale[@]}" -eq 0 ]; then
@@ -389,6 +540,7 @@ prune_stale_source_rules() {
         ufw --force delete "$num" >/dev/null 2>&1 || true
         info "  pruned stale rule: ${port}/tcp on $rule_ifc from $src"
     done < <(printf '%s\n' "${stale[@]}" | sort -t'|' -k1,1 -rn)
+    ufw_rules_invalidate
 }
 
 ## 3. Collect managed interfaces
@@ -414,6 +566,9 @@ while read -r ifc; do
         while read -r addr; do
             if [ -z "$addr" ]; then continue; fi
             if is_private_v4 "${addr%%/*}"; then
+                # No scope-link route: the source cannot be narrowed, so this
+                # opens the management ports to any source on that interface.
+                warn "  no link route on $ifc; allowing any source on this interface."
                 add_managed "$ifc" "" || true
                 matched=1
             fi
@@ -476,6 +631,15 @@ if [ "${#LAN_IFACES[@]}" -eq 0 ] && [ "$OVERLAY_FOUND" -eq 0 ] && [ "$FORCE" != 
     exit 1
 fi
 
+## 3.5 Purge untracked fail2ban ban tuples first: every ufw command rewrites
+##     the whole rules file, so a large ban list makes all of them slow.
+NEED_UFW_RELOAD=0
+purge_ban_tuples
+if [ "$NEED_UFW_RELOAD" = "1" ]; then
+    ufw reload >/dev/null 2>&1 || true
+    NEED_UFW_RELOAD=0
+fi
+
 ## 4. Apply allow rules (always before enabling UFW)
 if (echo > "/dev/tcp/127.0.0.1/${PVE_PORT}") >/dev/null 2>&1; then
     info "Proxmox VE detected on port ${PVE_PORT}."
@@ -488,40 +652,73 @@ for entry in ${MANAGED_IFACES[@]+"${MANAGED_IFACES[@]}"}; do
     allow_mgmt "${entry%%|*}" "${entry#*|}"
 done
 
-## 5. Cleanup legacy rules (only leftovers created by older versions)
-echo "Checking existing UFW rules for legacy entries..."
+## 5. Cleanup legacy rules
+# A bare rule such as "8006/tcp ALLOW IN Anywhere" is what the first versions
+# produced, but it is also what an operator gets from "ufw allow 8006". Delete
+# it on every run and any deliberate rule would be wiped at each boot, so the
+# migration runs once and leaves a marker behind. Force it with
+# LEGACY_CLEANUP=1.
+LEGACY_MARKER_DIR="/var/lib/security-access"
+LEGACY_MARKER="${LEGACY_MARKER_DIR}/legacy-cleanup-v2"
 
-# 5.1 Bare (interface less) rules created by the first version: 443/HTTPS and
-#     the unqualified 8006. Rules for other ports are never touched.
-delete_rules_matching '^\[ *[0-9]+\] +(443|443/tcp|https)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
-delete_rules_matching '^\[ *[0-9]+\] +(8006|8006/tcp)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))? *$'
+cleanup_legacy_rules() {
+    local member p ovl
+    echo "Checking existing UFW rules for legacy entries..."
 
-# 5.2 Older versions attached the management rules to the bridge MEMBER
-#     (end0, eno1, ...) instead of the bridge itself, and opened the overlay
-#     interfaces without any port filter. Both are dead weight now.
-BRIDGE_MEMBERS="$(awk '/^[[:space:]]*bridge-ports[[:space:]]/ {for (i=2; i<=NF; i++) if ($i != "none") print $i}' \
-                       /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | sort -u || true)"
-for member in $BRIDGE_MEMBERS; do
-    for p in "${ALLOW_PORTS[@]}"; do
-        delete_rules_matching "^\\[ *[0-9]+\\] +(${p}|${p}/tcp)( \\(v6\\))? +on ${member} +ALLOW (IN|OUT)"
+    # 5.1 Bare (interface less) rules created by the first version: 443/HTTPS
+    #     and the unqualified 8006. Rules for other ports are never touched.
+    #     "(out)" is part of the numbering output of OUT rules.
+    delete_rules_matching '^\[ *[0-9]+\] +(443|443/tcp|https)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))?( \(out\))? *$'
+    delete_rules_matching '^\[ *[0-9]+\] +(8006|8006/tcp)( \(v6\))? +ALLOW (IN|OUT) +Anywhere( \(v6\))?( \(out\))? *$'
+
+    # 5.2 Older versions attached the management rules to the bridge MEMBER
+    #     (end0, eno1, ...) instead of the bridge itself, and opened the overlay
+    #     interfaces without any port filter. Both are dead weight now.
+    for member in $(bridge_members); do
+        for p in "${ALLOW_PORTS[@]}"; do
+            delete_rules_matching "^\\[ *[0-9]+\\] +(${p}|${p}/tcp)( \\(v6\\))? +on ${member} +ALLOW (IN|OUT)"
+        done
     done
-done
 
-for ovl in tailscale0 CloudflareWARP warp0 cloudflared; do
-    delete_rules_matching "^\\[ *[0-9]+\\] +Anywhere( \\(v6\\))? +on ${ovl} +ALLOW (IN|OUT) +Anywhere( \\(v6\\))? *\$"
-done
+    for ovl in tailscale0 CloudflareWARP warp0 cloudflared; do
+        delete_rules_matching "^\\[ *[0-9]+\\] +Anywhere( \\(v6\\))? +on ${ovl} +ALLOW (IN|OUT) +Anywhere( \\(v6\\))?( \\(out\\))? *\$"
+    done
+}
 
-# 5.3 Drop source rules from a previous DHCP network.
+if [ "${LEGACY_CLEANUP:-auto}" = "1" ] || [ ! -f "$LEGACY_MARKER" ]; then
+    cleanup_legacy_rules
+    if install -d -m 0755 "$LEGACY_MARKER_DIR" 2>/dev/null && : > "$LEGACY_MARKER" 2>/dev/null; then
+        info "Legacy cleanup done once; marker: $LEGACY_MARKER"
+    else
+        warn "Could not write $LEGACY_MARKER; legacy cleanup will run again next time."
+    fi
+else
+    info "Legacy rule cleanup already done ($LEGACY_MARKER); skipping."
+fi
+
+# 5.3 Always: drop rules that can no longer be valid.
 prune_stale_source_rules
+prune_dead_iface_rules
 
 ## 6. Default policies and enable UFW
 echo "Initializing UFW policies..."
+if [ "${UFW_IPV6:-keep}" != "keep" ] && [ -f /etc/default/ufw ]; then
+    if grep -qE '^IPV6=' /etc/default/ufw; then
+        cur_v6=$(grep -m1 -E '^IPV6=' /etc/default/ufw | cut -d'"' -f2)
+        if [ "$cur_v6" != "$UFW_IPV6" ]; then
+            sed -i "s/^IPV6=.*/IPV6=\"${UFW_IPV6}\"/" /etc/default/ufw
+            info "UFW IPv6 set to $UFW_IPV6."
+        fi
+    fi
+fi
 systemctl enable ufw >/dev/null 2>&1 || true
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
+ufw default deny routed >/dev/null
 ufw logging low >/dev/null
 ufw --force enable >/dev/null
 info "UFW enabled; inbound limited to ${ALLOW_PORTS[*]}."
+post_apply_selfcheck
 
 ## 7. Forwarding: NAT and Tailscale
 # 7.1 Guest NAT: keep vmbr0-style internal bridges able to reach the uplink.
@@ -561,7 +758,7 @@ if iface_exists tailscale0; then
             if [ "$TS_IPV6_FORWARDING" = "1" ]; then
                 echo "net.ipv6.conf.all.forwarding = 1"
             fi
-        } > /etc/sysctl.d/99-tailscale-forward.conf
+        } | install_if_changed /etc/sysctl.d/99-tailscale-forward.conf 0644 || true
 
         # Apply only the keys we own; "sysctl --system" would re-apply every
         # file in /etc/sysctl.d and could overwrite unrelated runtime values.
@@ -602,18 +799,21 @@ if [ "$HAVE_FAIL2BAN" = "1" ]; then
         fi
     done
 
-    # 8.2 Filters
-    cat > /etc/fail2ban/filter.d/proxmox.conf <<'EOF'
+    # 8.2 Filters (written only when the content changes)
+    F2B_CONF_CHANGED=0
+    install_if_changed /etc/fail2ban/filter.d/proxmox.conf 0644 <<'EOF' || true
 [Definition]
 failregex = ^.*pveproxy\[\d+\]: authentication failure; rhost=<HOST> user=.*$
 ignoreregex =
 EOF
+    [ "$IFC_CHANGED" = "1" ] && F2B_CONF_CHANGED=1
 
-    cat > /etc/fail2ban/filter.d/ufw-management.conf <<'EOF'
+    install_if_changed /etc/fail2ban/filter.d/ufw-management.conf 0644 <<'EOF' || true
 [Definition]
 failregex = \[UFW (BLOCK|AUDIT)\].*SRC=<HOST> DST=
 ignoreregex =
 EOF
+    [ "$IFC_CHANGED" = "1" ] && F2B_CONF_CHANGED=1
 
     # ufw writes to /var/log/ufw.log only when rsyslog is present.
     if systemctl is-active --quiet rsyslog 2>/dev/null; then
@@ -637,8 +837,8 @@ maxretry = 5"
         UFW_JAIL_BLOCK="# [ufw] jail skipped: the ufw binary is not installed"
     fi
 
-    # 8.3 Jail definitions (jail.local is overwritten on every run)
-    cat > /etc/fail2ban/jail.local <<EOF
+    # 8.3 Jail definitions (jail.local is rewritten only when it changes)
+    install_if_changed /etc/fail2ban/jail.local 0644 <<EOF || true
 [DEFAULT]
 # Internal, CGNAT and Tailscale ranges must never be banned: a ban is inserted
 # before the allow rules and would override them.
@@ -664,6 +864,8 @@ maxretry = 3
 ${UFW_JAIL_BLOCK}
 EOF
 
+    [ "$IFC_CHANGED" = "1" ] && F2B_CONF_CHANGED=1
+
     systemctl enable fail2ban >/dev/null 2>&1 || true
 
     # 8.4 Optional: delete the ban database as well (FAIL2BAN_PURGE_DB=1).
@@ -673,13 +875,17 @@ EOF
         warn "  fail2ban database purged; check for orphan 'DENY' rules afterwards."
     fi
 
-    # --no-block is mandatory. The fail2ban start job can only be satisfied
-    # after network.target, and this script may be running inside
-    # networking.service (Before=network.target): waiting here deadlocks boot.
-    if systemctl restart --no-block fail2ban >/dev/null 2>&1; then
-        info "fail2ban restart requested (non-blocking)."
+    if [ "$F2B_CONF_CHANGED" = "1" ] || ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+        # --no-block is mandatory. The fail2ban start job can only be satisfied
+        # after network.target, and this script may be running inside
+        # networking.service (Before=network.target): waiting here deadlocks boot.
+        if systemctl restart --no-block fail2ban >/dev/null 2>&1; then
+            info "fail2ban restart requested (non-blocking)."
+        else
+            warn "fail2ban restart failed; see /var/log/fail2ban.log."
+        fi
     else
-        warn "fail2ban restart failed; see /var/log/fail2ban.log."
+        info "fail2ban configuration unchanged; restart skipped."
     fi
 
     # 8.5 Purge every active ban: a reboot must never inherit a stale ban.
@@ -724,7 +930,7 @@ fi
 # stack. It must only ENQUEUE the real work: running this script synchronously
 # from here blocks networking.service, see section 8 of the header.
 install -d -m 0755 /etc/network/if-up.d
-cat > /etc/network/if-up.d/security-access <<'EOF'
+install_if_changed /etc/network/if-up.d/security-access 0755 <<'EOF' || true
 #!/bin/sh
 [ "$MODE" = "start" ] || exit 0
 [ -x /usr/local/bin/security-access.sh ] || exit 0
@@ -745,11 +951,11 @@ esac
 /usr/bin/systemctl start --no-block security-access.service >/dev/null 2>&1 || exit 0
 exit 0
 EOF
-chmod 0755 /etc/network/if-up.d/security-access
+[ "$IFC_CHANGED" = "1" ] && info "Boot hook updated."
 
 # The unit that actually applies the rules. It is ordered after the boot
 # network and after fail2ban, so no ordering cycle can form.
-cat > /etc/systemd/system/security-access.service <<'EOF'
+install_if_changed /etc/systemd/system/security-access.service 0644 <<'EOF' || true
 [Unit]
 Description=Apply security-access firewall rules
 Documentation=https://github.com/FusionPlmH/resources
@@ -765,7 +971,10 @@ TimeoutStartSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload >/dev/null 2>&1 || true
+if [ "$IFC_CHANGED" = "1" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    info "security-access.service updated (daemon-reload done)."
+fi
 systemctl enable security-access.service >/dev/null 2>&1 || true
 info "Boot hook installed: if-up.d hook + security-access.service"
 
