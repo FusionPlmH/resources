@@ -90,6 +90,7 @@ error() { echo -e "${RED}$*${NC}"; }
 #------------------------------------------------------------------------------
 SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/FusionPlmH/resources/refs/heads/main/security-access.sh}"
 SELF_DEST="/usr/local/bin/security-access.sh"
+SCRIPT_VERSION="3"
 SELF_UPDATE_REQUESTED=0
 NO_SELF_INSTALL=0
 
@@ -105,6 +106,7 @@ for arg in "$@"; do
         --no-self-install) NO_SELF_INSTALL=1 ;;
         -h|--help)
             echo "Usage: $0 [--self-update] [--no-self-install]"
+            echo "  version: $SCRIPT_VERSION"
             echo "  --self-update      download, verify and replace $SELF_DEST, then re-exec"
             echo "  --no-self-install  do not copy the running file to $SELF_DEST"
             echo "Environment:"
@@ -160,6 +162,18 @@ self_update() {
         rm -f "$tmp"
         warn "Self-update: syntax check failed, keeping the current file."
         return 1
+    fi
+
+    # Never let the download replace a newer local copy: a CDN timestamp or a
+    # reverted commit would otherwise silently roll the host back.
+    cur_ver="$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9]*\)".*/\1/p' "$SELF_DEST" 2>/dev/null | head -1)"
+    new_ver="$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9]*\)".*/\1/p' "$tmp" 2>/dev/null | head -1)"
+    cur_ver="${cur_ver:-0}"
+    new_ver="${new_ver:-0}"
+    if [ "$new_ver" -lt "$cur_ver" ]; then
+        rm -f "$tmp"
+        warn "Self-update: remote version $new_ver is older than local $cur_ver; keeping local."
+        return 0
     fi
 
     if [ -f "$SELF_DEST" ] && cmp -s "$tmp" "$SELF_DEST"; then
@@ -377,6 +391,30 @@ ufw_rules() {
     printf '%s\n' "$UFW_STATUS_CACHE"
 }
 ufw_rules_invalidate() { UFW_STATUS_CACHE=""; }
+
+# The ufw program does not wait for the xtables lock. At boot tailscaled and
+# fail2ban may still be programming rules, which makes ufw abort with
+# "Can't lock /run/xtables.lock" and, under "set -e", kills the whole run.
+# Retry those transient failures instead of failing the boot unit.
+ufw() {
+    local rc tries=0 errf="/run/.security-access.ufw.err"
+    while : ; do
+        command ufw "$@" 2>"$errf"
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        if ! grep -qE 'xtables\.lock|Another app is currently holding' "$errf" 2>/dev/null; then
+            cat "$errf" >&2
+            return "$rc"
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 10 ]; then
+            warn "ufw: xtables lock still busy after ${tries} retries."
+            cat "$errf" >&2
+            return "$rc"
+        fi
+        sleep 1
+    done
+}
 
 # Bridge member interfaces (end0, eno1, ...) from the ifupdown files.
 bridge_members() {
@@ -959,14 +997,20 @@ install_if_changed /etc/systemd/system/security-access.service 0644 <<'EOF' || t
 [Unit]
 Description=Apply security-access firewall rules
 Documentation=https://github.com/FusionPlmH/resources
-After=network-online.target fail2ban.service
+# tailscaled programs iptables at startup and holds the xtables lock; wait for
+# it so ufw does not fail with "Can't lock /run/xtables.lock".
+After=network-online.target fail2ban.service tailscaled.service
 Wants=network-online.target
 ConditionPathExists=/usr/local/bin/security-access.sh
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/security-access.sh --self-update
 TimeoutStartSec=300
+Restart=on-failure
+RestartSec=20
 
 [Install]
 WantedBy=multi-user.target
